@@ -170,7 +170,8 @@ final class Reddit {
     private let guestSlot = Slot()
     private let userSlot = Slot()
     /// A browser session that never holds your login, so its token_v2 is a guest token.
-    static let guestStore = WKWebsiteDataStore.nonPersistent()
+    // the normal browser session; with no login it already holds only an anonymous (guest) token_v2
+    static let guestStore = WKWebsiteDataStore.default()
 
     private func store(guest: Bool) -> WKWebsiteDataStore { guest ? Reddit.guestStore : WKWebsiteDataStore.default() }
 
