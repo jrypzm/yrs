@@ -16,6 +16,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         UINavigationBar.appearance().standardAppearance = bar
         UINavigationBar.appearance().scrollEdgeAppearance = bar
 
+        Reddit.shared.prepare()
         // opens on Reddit's normal homepage (Popular); the ⋯ in the corner opens everything else
         let home = Lists.sub("popular")
         let nav = UINavigationController(rootViewController: home)

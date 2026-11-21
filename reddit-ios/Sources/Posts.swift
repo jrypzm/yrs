@@ -121,7 +121,7 @@ enum Lists {
         return Feed(title, choices: choices) { choice, page, done in
             if page == 1 { cur.after = nil }
             var (p, q) = path(choice)
-            q["limit"] = "40"
+            q["limit"] = "25"
             if let a = cur.after { q["after"] = a }
             Reddit.shared.get(p, q) { r in
                 done(r.map { j in

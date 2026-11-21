@@ -96,9 +96,16 @@ final class Reddit {
         token(refresh: false) { [weak self] t in
             guard let s = self else { return }
             guard let t = t else { done(.failure(.offline("Couldn't reach Reddit. Pull down to try again."))); return }
-            s.call(path, q, token: t, retry: true) { r in
-                // Reddit refuses the /new listing to app tokens; the same posts come through search, newest first
+            // Reddit refuses /new to app tokens: once seen, go straight to search (newest first)
+            if Reddit.newRefused, let (fp, fq) = Reddit.newViaSearch(path, q) {
+                s.call(fp, fq, token: t, retry: true, done: done)
+                return
+            }
+            let isNew = Reddit.newViaSearch(path, q) != nil
+            // for /new, a refusal is Reddit's rule, not a stale token: don't spend seconds refreshing it
+            s.call(path, q, token: t, retry: !isNew) { r in
                 if case .failure(.http(403)) = r, let (fp, fq) = Reddit.newViaSearch(path, q) {
+                    Reddit.newRefused = true
                     s.call(fp, fq, token: t, retry: true, done: done)
                 } else {
                     done(r)
@@ -106,6 +113,15 @@ final class Reddit {
             }
         }
     }
+
+    /// Remembered across launches: whether Reddit refuses the /new listing to this app.
+    static var newRefused: Bool {
+        get { UserDefaults.standard.bool(forKey: "newRefused") }
+        set { UserDefaults.standard.set(newValue, forKey: "newRefused") }
+    }
+
+    /// Gets the token ready at launch, so the first feed doesn't wait for it.
+    func prepare() { token(refresh: false) { _ in } }
 
     /// "/r/pics/new" → search r/pics sorted by new; the front page's "/new" → all of Reddit, newest.
     static func newViaSearch(_ path: String, _ q: [String: String]) -> (String, [String: String])? {

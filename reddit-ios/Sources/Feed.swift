@@ -159,7 +159,7 @@ class Feed: UITableViewController {
     }
 
     override func tableView(_ tableView: UITableView, willDisplay cell: UITableViewCell, forRowAt ip: IndexPath) {
-        if more, !loading, ip.row >= items.count - 1 {
+        if more, !loading, ip.row >= items.count - 8 {   // fetch the next page before you reach the end
             page += 1
             load()
         }
