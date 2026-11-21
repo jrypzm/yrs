@@ -146,12 +146,12 @@ enum Lists {
     }
 
     static func front() -> Feed {
-        feed(Reddit.shared.isSignedIn ? "Your front page" : "Front page", choices: ["Best", "Hot", "New", "Top"]) { c in
+        feed("Front page", choices: ["Hot", "New", "Top", "Rising"]) { c in
             switch c {
-            case 0: return ("/best", [:])
-            case 1: return ("/hot", [:])
-            case 2: return ("/new", [:])
-            default: return ("/top", ["t": "day"])
+            case 0: return ("/hot", [:])
+            case 1: return ("/new", [:])
+            case 2: return ("/top", ["t": "day"])
+            default: return ("/rising", [:])
             }
         }
     }

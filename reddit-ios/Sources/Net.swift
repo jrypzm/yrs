@@ -71,7 +71,8 @@ final class Reddit {
         return URLSession(configuration: c)
     }()
 
-    var isSignedIn: Bool { UserDefaults.standard.bool(forKey: "signedIn") }
+    /// No login: the app only ever uses the guest token.
+    var isSignedIn: Bool { false }
 
     // MARK: addresses
 
