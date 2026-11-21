@@ -128,7 +128,20 @@ final class Reddit {
     }
 
     /// Gets both tokens ready at launch, so the first feed doesn't wait for them.
-    func prepare() { token(guest: true, refresh: false) { _ in }; if isSignedIn { token(guest: false, refresh: false) { _ in } } }
+    func prepare() {
+        // one time: drop any leftover login from older versions, so the token is truly a guest token
+        if !UserDefaults.standard.bool(forKey: "wentGuest") {
+            UserDefaults.standard.set(true, forKey: "wentGuest")
+            let store = WKWebsiteDataStore.default()
+            store.httpCookieStore.getAllCookies { cookies in
+                let g = DispatchGroup()
+                for c in cookies where c.domain.hasSuffix("reddit.com") { g.enter(); store.httpCookieStore.delete(c) { g.leave() } }
+                g.notify(queue: .main) { self.guestSlot.value = nil; self.token(guest: true, refresh: false) { _ in } }
+            }
+        } else {
+            token(guest: true, refresh: false) { _ in }
+        }
+    }
 
     private func call(_ path: String, _ q: [String: String], token: String, guest: Bool, refresh: Bool, done: @escaping (Result<Any, APIError>) -> Void) {
         var req = URLRequest(url: url(path, q))
