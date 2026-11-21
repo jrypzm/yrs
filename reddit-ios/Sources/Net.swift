@@ -270,17 +270,17 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
         let c = WKWebViewConfiguration()
         c.websiteDataStore = store
         c.applicationNameForUserAgent = safariSuffix
-        let v = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 500), configuration: c)
+        // full-screen behind the app, so iOS gives it full resources and runs Reddit's JS check
+        let frame = UIApplication.shared.windows.first?.bounds ?? CGRect(x: 0, y: 0, width: 390, height: 700)
+        let v = WKWebView(frame: frame, configuration: c)
         v.navigationDelegate = self
         v.isUserInteractionEnabled = false
-        v.alpha = 0.02
-        // must be on screen (behind the app), or iOS suspends it and Reddit's check never runs
         if let w = UIApplication.shared.windows.first(where: { $0.isKeyWindow }) ?? UIApplication.shared.windows.first {
             w.insertSubview(v, at: 0)
         }
         web = v
         v.load(URLRequest(url: URL(string: "https://www.reddit.com/")!, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 25))
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.stop() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) { [weak self] in self?.stop() }
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
@@ -291,6 +291,7 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failMsg = (error as NSError).localizedDescription; check() }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failMsg = (error as NSError).localizedDescription; check() }
 
+    private var reloaded = false
     private func check() {
         guard poll == nil else { return }
         poll = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -298,7 +299,12 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
             s.tries += 1
             s.store.httpCookieStore.getAllCookies { cookies in
                 let has = cookies.contains { $0.name == "token_v2" && $0.domain.hasSuffix("reddit.com") && !$0.value.isEmpty }
-                if has || s.tries >= 38 { s.stop() }
+                if has || s.tries >= 46 { s.stop(); return }
+                // Reddit's check sometimes needs a second visit: reload once around 7s in
+                if !s.reloaded, s.tries == 14 {
+                    s.reloaded = true
+                    s.web?.load(URLRequest(url: URL(string: "https://www.reddit.com/")!, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 25))
+                }
             }
         }
     }
@@ -313,8 +319,10 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
         let d = done; done = nil
         TokenWeb.active.removeAll { $0 === self }
         store.httpCookieStore.getAllCookies { cookies in
-            let names = cookies.filter { $0.domain.hasSuffix("reddit.com") }.map { $0.name }.sorted().joined(separator: ",")
-            TokenWeb.diag = "loaded=\(self.loaded) http=\(self.status) at=\(url)\ncookies: \(names.isEmpty ? "none" : names)\(self.failMsg.isEmpty ? "" : "\nweb: \(self.failMsg)")"
+            let mine = cookies.filter { $0.domain.hasSuffix("reddit.com") }
+            let tok = mine.contains { $0.name == "token_v2" && !$0.value.isEmpty }
+            let names = mine.map { $0.name }.sorted().joined(separator: ",")
+            TokenWeb.diag = "token_v2=\(tok ? "YES" : "no") · loaded=\(self.loaded) http=\(self.status)\ncookies: \(names.isEmpty ? "none" : names)\(self.failMsg.isEmpty ? "" : " · \(self.failMsg)")"
             DispatchQueue.main.async { malloc_zone_pressure_relief(nil, 0); d?() }
         }
     }

@@ -189,7 +189,7 @@ final class Cell: UITableViewCell {
     override init(style: CellStyle, reuseIdentifier: String?) {
         super.init(style: .subtitle, reuseIdentifier: reuseIdentifier)
         backgroundColor = .black
-        textLabel?.numberOfLines = 3
+        textLabel?.numberOfLines = 8
         textLabel?.font = .systemFont(ofSize: 16, weight: .medium)
         detailTextLabel?.numberOfLines = 4
         detailTextLabel?.font = .systemFont(ofSize: 13)
