@@ -39,13 +39,7 @@ final class HomeVC: Feed, UISearchBarDelegate {
         let q = (b.text ?? "").trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return }
         b.resignFirstResponder()
-        let low = q.lowercased()
-        // r/sub, u/user and links open natively; a word search opens in Safari (Reddit blocks the app's search)
-        if low.hasPrefix("r/") || low.hasPrefix("/r/") || low.hasPrefix("u/") || low.hasPrefix("/u/") || low.contains("reddit.com") || low.contains("redd.it") {
-            if let vc = HomeVC.destination(q) { navigationController?.pushViewController(vc, animated: true) }
-        } else if let enc = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            Safari.open("/search?q=\(enc)&include_over_18=on", from: self)
-        }
+        if let vc = HomeVC.destination(q) { navigationController?.pushViewController(vc, animated: true) }
     }
 
     /// "r/pics" or "pics" opens it, "u/name" a person, a link its page; anything else is searched.

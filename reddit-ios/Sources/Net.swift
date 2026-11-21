@@ -93,20 +93,32 @@ final class Reddit {
     // MARK: reading
 
     func get(_ path: String, _ q: [String: String] = [:], done: @escaping (Result<Any, APIError>) -> Void) {
-        token(refresh: false) { [weak self] t in
+        // public reading (subreddits, search, new, profiles) goes through a guest token, which Reddit
+        // serves fully; your own login is used only for your front page and your subs.
+        let preferGuest = Reddit.isPublic(path) || !isSignedIn
+        attempt(path, q, guest: preferGuest, triedGuest: preferGuest, done: done)
+    }
+
+    /// Public content any logged-out visitor can read (so the guest token works and isn't restricted).
+    static func isPublic(_ path: String) -> Bool {
+        var p = path
+        while p.hasPrefix("/") { p.removeFirst() }
+        return p.hasPrefix("r/") || p.hasPrefix("user/") || p.hasPrefix("search")
+            || p.hasPrefix("by_id") || p.hasPrefix("comments") || p.hasPrefix("subreddits/search")
+    }
+
+    private func attempt(_ path: String, _ q: [String: String], guest: Bool, triedGuest: Bool, done: @escaping (Result<Any, APIError>) -> Void) {
+        token(guest: guest, refresh: false) { [weak self] t in
             guard let s = self else { return }
-            guard let t = t else { done(.failure(.offline("Couldn't reach Reddit. Pull down to try again."))); return }
-            // Reddit refuses /new to app tokens: once seen, go straight to search (newest first)
-            if Reddit.newRefused, let (fp, fq) = Reddit.newViaSearch(path, q) {
-                s.call(fp, fq, token: t, retry: true, done: done)
+            guard let t = t else {
+                if !guest { s.attempt(path, q, guest: true, triedGuest: true, done: done) }
+                else { done(.failure(.offline("Couldn't reach Reddit. Pull down to try again."))) }
                 return
             }
-            let isNew = Reddit.newViaSearch(path, q) != nil
-            // for /new, a refusal is Reddit's rule, not a stale token: don't spend seconds refreshing it
-            s.call(path, q, token: t, retry: !isNew) { r in
-                if case .failure(.http(403)) = r, let (fp, fq) = Reddit.newViaSearch(path, q) {
-                    Reddit.newRefused = true
-                    s.call(fp, fq, token: t, retry: true, done: done)
+            s.call(path, q, token: t, guest: guest, refresh: true) { r in
+                // the logged-in token is more restricted than a guest one: on a refusal, try the guest token
+                if case .failure(.http(403)) = r, !triedGuest {
+                    s.attempt(path, q, guest: true, triedGuest: true, done: done)
                 } else {
                     done(r)
                 }
@@ -114,35 +126,10 @@ final class Reddit {
         }
     }
 
-    /// Remembered across launches: whether Reddit refuses the /new listing to this app.
-    static var newRefused: Bool {
-        get { UserDefaults.standard.bool(forKey: "newRefused") }
-        set { UserDefaults.standard.set(newValue, forKey: "newRefused") }
-    }
+    /// Gets both tokens ready at launch, so the first feed doesn't wait for them.
+    func prepare() { token(guest: true, refresh: false) { _ in }; if isSignedIn { token(guest: false, refresh: false) { _ in } } }
 
-    /// Gets the token ready at launch, so the first feed doesn't wait for it.
-    func prepare() { token(refresh: false) { _ in } }
-
-    /// "/r/pics/new" → search r/pics sorted by new; the front page's "/new" → all of Reddit, newest.
-    static func newViaSearch(_ path: String, _ q: [String: String]) -> (String, [String: String])? {
-        var p = path
-        while p.count > 1, p.hasSuffix("/") { p.removeLast() }
-        guard p.hasSuffix("/new") else { return nil }
-        var fq = q
-        fq["sort"] = "new"
-        fq["t"] = "all"
-        fq["include_over_18"] = "on"
-        let parts = p.split(separator: "/").map(String.init)
-        if parts.count == 3, parts[0] == "r", !["all", "popular"].contains(parts[1].lowercased()) {
-            fq["q"] = "subreddit:\(parts[1])"
-            fq["restrict_sr"] = "1"
-            return ("/r/\(parts[1])/search", fq)
-        }
-        fq["q"] = "self:yes OR self:no"
-        return ("/search", fq)
-    }
-
-    private func call(_ path: String, _ q: [String: String], token: String, retry: Bool, done: @escaping (Result<Any, APIError>) -> Void) {
+    private func call(_ path: String, _ q: [String: String], token: String, guest: Bool, refresh: Bool, done: @escaping (Result<Any, APIError>) -> Void) {
         var req = URLRequest(url: url(path, q))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue(safariUA, forHTTPHeaderField: "User-Agent")
@@ -153,10 +140,10 @@ final class Reddit {
                 DispatchQueue.main.async { done(.failure(.offline((err as NSError).code == NSURLErrorNotConnectedToInternet ? "No internet connection." : err.localizedDescription))) }
                 return
             }
-            // a stale or guest token Reddit rejects: get a fresh token_v2 from the browser and try once more
-            if (code == 401 || code == 403), retry {
-                self.token(refresh: true) { fresh in
-                    if let fresh = fresh, fresh != token { self.call(path, q, token: fresh, retry: false, done: done) }
+            // a lapsed token: get a fresh token_v2 of the same kind and try once more
+            if (code == 401 || code == 403), refresh {
+                self.token(guest: guest, refresh: true) { fresh in
+                    if let fresh = fresh, fresh != token { self.call(path, q, token: fresh, guest: guest, refresh: false, done: done) }
                     else { DispatchQueue.main.async { done(.failure(.http(code))) } }
                 }
                 return
@@ -170,51 +157,60 @@ final class Reddit {
         }.resume()
     }
 
-    // MARK: the token (the reddit.com "token_v2" cookie, used as the API key)
+    // MARK: the tokens (the reddit.com "token_v2" cookie, used as the API key)
+    // Two of them: a guest token (from a logged-out browser session) for public reading, and your
+    // signed-in token (from the browser you logged in with) for your own front page and subs.
 
-    private var cached: String?
-    private var loading = false
-    private var waiting: [(String?) -> Void] = []
+    private final class Slot {
+        var value: String?
+        var loading = false
+        var waiting: [(String?) -> Void] = []
+    }
+    private let guestSlot = Slot()
+    private let userSlot = Slot()
+    /// A browser session that never holds your login, so its token_v2 is a guest token.
+    static let guestStore = WKWebsiteDataStore.nonPersistent()
 
-    /// The token_v2 value. `refresh` forces a new one from the browser (after Reddit rejects one).
-    private func token(refresh: Bool, done: @escaping (String?) -> Void) {
-        if !refresh, let t = cached { done(t); return }
-        waiting.append(done)
-        guard !loading else { return }
-        loading = true
-        let finish: (String?) -> Void = { [weak self] t in
-            guard let s = self else { return }
-            s.cached = t
-            s.loading = false
-            let w = s.waiting; s.waiting = []
+    private func store(guest: Bool) -> WKWebsiteDataStore { guest ? Reddit.guestStore : WKWebsiteDataStore.default() }
+
+    private func token(guest: Bool, refresh: Bool, done: @escaping (String?) -> Void) {
+        let slot = guest ? guestSlot : userSlot
+        if !refresh, let v = slot.value { done(v); return }
+        slot.waiting.append(done)
+        guard !slot.loading else { return }
+        slot.loading = true
+        let st = store(guest: guest)
+        let finish: (String?) -> Void = { t in
+            slot.value = t
+            slot.loading = false
+            let w = slot.waiting; slot.waiting = []
             w.forEach { $0(t) }
         }
-        if refresh { cached = nil; TokenWeb.clearCookie { self.fetchToken(finish) } }
-        else { readCookie { t in if let t = t { finish(t) } else { self.fetchToken(finish) } } }
+        if refresh { slot.value = nil; TokenWeb.clearCookie(st) { self.fetchToken(st, finish) } }
+        else { readCookie(st) { t in if let t = t { finish(t) } else { self.fetchToken(st, finish) } } }
     }
 
-    private func readCookie(_ done: @escaping (String?) -> Void) {
-        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+    private func readCookie(_ store: WKWebsiteDataStore, _ done: @escaping (String?) -> Void) {
+        store.httpCookieStore.getAllCookies { cookies in
             let t = cookies.first { $0.name == "token_v2" && $0.domain.hasSuffix("reddit.com") }?.value
             DispatchQueue.main.async { done((t?.isEmpty == false) ? t : nil) }
         }
     }
 
-    /// Loads reddit.com in a hidden web view until a token_v2 cookie appears, then reads it.
-    private func fetchToken(_ done: @escaping (String?) -> Void) {
-        TokenWeb.warmUp { [weak self] in self?.readCookie(done) }
+    private func fetchToken(_ store: WKWebsiteDataStore, _ done: @escaping (String?) -> Void) {
+        TokenWeb.warmUp(store) { [weak self] in self?.readCookie(store, done) }
     }
 
     // MARK: signing in and out
 
     func signedIn(_ yes: Bool) {
         UserDefaults.standard.set(yes, forKey: "signedIn")
-        cached = nil
+        userSlot.value = nil
         NotificationCenter.default.post(name: Reddit.signedIn, object: nil)
     }
 
     func signOut() {
-        cached = nil
+        userSlot.value = nil
         let store = WKWebsiteDataStore.default()
         store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
             self?.signedIn(false)
@@ -222,22 +218,24 @@ final class Reddit {
     }
 }
 
-/// A hidden web view used only to get or refresh the reddit.com token_v2 cookie, then let go of.
+/// A hidden web view used only to get or refresh a reddit.com token_v2 cookie, then let go of.
+/// It takes the data store to use: the shared one (your login) or the guest one (logged out).
 final class TokenWeb: NSObject, WKNavigationDelegate {
-    private static var shared: TokenWeb?
+    private static var active: [TokenWeb] = []
     private var web: WKWebView?
+    private var store: WKWebsiteDataStore!
     private var done: (() -> Void)?
     private var poll: Timer?
     private var tries = 0
 
-    static func warmUp(_ done: @escaping () -> Void) {
+    static func warmUp(_ store: WKWebsiteDataStore, _ done: @escaping () -> Void) {
         let t = TokenWeb()
-        shared = t
+        t.store = store
+        active.append(t)
         t.start(done)
     }
 
-    static func clearCookie(_ done: @escaping () -> Void) {
-        let store = WKWebsiteDataStore.default()
+    static func clearCookie(_ store: WKWebsiteDataStore, _ done: @escaping () -> Void) {
         store.httpCookieStore.getAllCookies { cookies in
             let group = DispatchGroup()
             for c in cookies where c.name == "token_v2" && c.domain.hasSuffix("reddit.com") {
@@ -250,13 +248,12 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
     private func start(_ done: @escaping () -> Void) {
         self.done = done
         let c = WKWebViewConfiguration()
-        c.websiteDataStore = .default()
+        c.websiteDataStore = store
         c.applicationNameForUserAgent = safariSuffix
         let v = WKWebView(frame: CGRect(x: 0, y: 0, width: 400, height: 400), configuration: c)
         v.navigationDelegate = self
         web = v
         v.load(URLRequest(url: URL(string: "https://www.reddit.com/")!, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 25))
-        // give up after 15 s whatever happens
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.stop() }
     }
 
@@ -264,13 +261,12 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { check() }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { check() }
 
-    /// After the page loads, poll briefly for the token_v2 cookie (the challenge may set it late).
     private func check() {
         guard poll == nil else { return }
         poll = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let s = self else { return }
             s.tries += 1
-            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            s.store.httpCookieStore.getAllCookies { cookies in
                 let has = cookies.contains { $0.name == "token_v2" && $0.domain.hasSuffix("reddit.com") && !$0.value.isEmpty }
                 if has || s.tries >= 20 { s.stop() }
             }
@@ -283,7 +279,7 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
         web?.stopLoading()
         web = nil
         let d = done; done = nil
-        TokenWeb.shared = nil
+        TokenWeb.active.removeAll { $0 === self }
         DispatchQueue.main.async { malloc_zone_pressure_relief(nil, 0) }
         d?()
     }
