@@ -79,6 +79,18 @@ final class Reddit {
     private var tokenUntil = Date.distantPast
     private var minting = false
     private var waiting: [(String?) -> Void] = []
+    /// "user" once a real logged-in token is minted, else "logged-out".
+    private var tokenKind = "no"
+
+    /// The `sub` claim inside a Reddit access token (a JWT), to tell a real login from a guest token.
+    static func subject(of jwt: String) -> String {
+        let parts = jwt.split(separator: ".")
+        guard parts.count >= 2 else { return "" }
+        var b = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while b.count % 4 != 0 { b += "=" }
+        guard let d = Data(base64Encoded: b), let j = try? JSONSerialization.jsonObject(with: d) as? JSON else { return "" }
+        return (j["sub"] as? String) ?? ""
+    }
 
     var isSignedIn: Bool { UserDefaults.standard.bool(forKey: "signedIn") }
 
@@ -136,7 +148,13 @@ final class Reddit {
             }
             let r: Result<Any, APIError>
             if code == 404 { r = .failure(.http(404)) }
-            else if !(200 ..< 300).contains(code) { r = .failure(.http(code)) }
+            else if !(200 ..< 300).contains(code) {
+                // show exactly what Reddit said, so a failing tab tells us the real reason
+                var body = data.flatMap { String(data: $0.prefix(160), encoding: .utf8) } ?? ""
+                body = body.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+                let ep = (self.url(path, q).path)
+                r = .failure(.offline("\(ep) → \(code) · \(self.tokenKind) token\(body.isEmpty ? "" : "\nReddit: \(body)")"))
+            }
             else if let d = data, let j = try? JSONSerialization.jsonObject(with: d) { r = .success(j) }
             else { r = .failure(.bad) }
             DispatchQueue.main.async { done(r) }
@@ -182,6 +200,7 @@ final class Reddit {
                     let secs = (j["expires_in"] as? NSNumber)?.doubleValue ?? 3600
                     self.token = t
                     self.tokenUntil = Date().addingTimeInterval(secs)
+                    self.tokenKind = Reddit.subject(of: t).hasPrefix("loid") ? "logged-out" : "user"
                 }
                 DispatchQueue.main.async { done(tok) }
             }.resume()
