@@ -265,11 +265,17 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
         let c = WKWebViewConfiguration()
         c.websiteDataStore = store
         c.applicationNameForUserAgent = safariSuffix
-        let v = WKWebView(frame: CGRect(x: 0, y: 0, width: 400, height: 400), configuration: c)
+        let v = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 500), configuration: c)
         v.navigationDelegate = self
+        v.isUserInteractionEnabled = false
+        v.alpha = 0.02
+        // must be on screen (behind the app), or iOS suspends it and Reddit's check never runs
+        if let w = UIApplication.shared.windows.first(where: { $0.isKeyWindow }) ?? UIApplication.shared.windows.first {
+            w.insertSubview(v, at: 0)
+        }
         web = v
         v.load(URLRequest(url: URL(string: "https://www.reddit.com/")!, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 25))
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.stop() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.stop() }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { check() }
@@ -283,7 +289,7 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
             s.tries += 1
             s.store.httpCookieStore.getAllCookies { cookies in
                 let has = cookies.contains { $0.name == "token_v2" && $0.domain.hasSuffix("reddit.com") && !$0.value.isEmpty }
-                if has || s.tries >= 20 { s.stop() }
+                if has || s.tries >= 38 { s.stop() }
             }
         }
     }
@@ -292,6 +298,7 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
         poll?.invalidate(); poll = nil
         web?.navigationDelegate = nil
         web?.stopLoading()
+        web?.removeFromSuperview()
         web = nil
         let d = done; done = nil
         TokenWeb.active.removeAll { $0 === self }
