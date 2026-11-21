@@ -252,7 +252,8 @@ final class PinVC: GridVC {
 
     private func openPicture() {
         if let v = pin.video { play(v); return }
-        if let (u, _) = pin.image("orig") ?? pin.image("736x") { present(ViewerVC([u]), animated: true) }
+        let imgs = pin.allImages()
+        if !imgs.isEmpty { present(ViewerVC(imgs), animated: true) }
     }
 
     private func play(_ u: URL) {
@@ -296,6 +297,7 @@ final class PinHeader: UIView, GridHeader {
     private let pin: Pin
     private let picture = UIImageView()
     private let badge = UILabel()
+    private let count = UILabel()
     private let stack = UIStackView()
     private var shownPictureFor = -1
 
@@ -324,6 +326,16 @@ final class PinHeader: UIView, GridHeader {
             badge.layer.cornerRadius = 22
             badge.clipsToBounds = true
             picture.addSubview(badge)
+        }
+        if p.isGallery {
+            count.text = "  1 / \(p.slides.count)  "
+            count.font = .systemFont(ofSize: 13, weight: .semibold)
+            count.textColor = .white
+            count.backgroundColor = UIColor(white: 0, alpha: 0.6)
+            count.textAlignment = .center
+            count.layer.cornerRadius = 13
+            count.clipsToBounds = true
+            picture.addSubview(count)
         }
         stack.axis = .vertical
         stack.spacing = 8
@@ -389,6 +401,8 @@ final class PinHeader: UIView, GridHeader {
         let ph = picHeight(w)
         picture.frame = CGRect(x: 12, y: 12, width: w - 24, height: ph)
         badge.frame = CGRect(x: (picture.bounds.width - 56) / 2, y: (ph - 56) / 2, width: 56, height: 56)
+        count.sizeToFit()
+        count.frame = CGRect(x: picture.bounds.width - count.bounds.width - 12, y: ph - 38, width: count.bounds.width, height: 26)
         stack.frame = CGRect(x: 16, y: 12 + ph + 18, width: w - 32, height: stackHeight(w))
         loadPicture(w)
     }

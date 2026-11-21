@@ -69,9 +69,8 @@ struct Pin {
         return UIColor(red: CGFloat(v >> 16 & 255) / 600, green: CGFloat(v >> 8 & 255) / 600, blue: CGFloat(v & 255) / 600, alpha: 1)
     }
 
-    /// The picture at one of Pinterest's sizes ("236x", "474x", "736x", "orig"), with height / width.
-    func image(_ size: String) -> (URL, CGFloat)? {
-        let imgs = j.o("images")
+    /// One of Pinterest's sizes ("236x", "474x", "736x", "orig") from an images dict, with h/w.
+    static func pick(_ imgs: JSON, _ size: String) -> (URL, CGFloat)? {
         for k in [size, "474x", "736x", "236x", "orig"] {
             let im = imgs.o(k)
             if let u = URL(string: im.s("url")), im.i("width") > 0 {
@@ -79,6 +78,22 @@ struct Pin {
             }
         }
         return nil
+    }
+
+    /// The pin's (cover) picture at the given size.
+    func image(_ size: String) -> (URL, CGFloat)? { Pin.pick(j.o("images"), size) }
+
+    /// A multi-photo "carousel" pin's slides (more than one means it's swipeable).
+    var slides: [JSON] { j.o("carousel_data").a("carousel_slots") }
+    var isGallery: Bool { slides.count > 1 }
+
+    /// Every full-size picture to view: each carousel slide, or just the one cover.
+    func allImages(_ size: String = "orig") -> [URL] {
+        if isGallery {
+            let urls = slides.compactMap { Pin.pick($0.o("images"), size)?.0 }
+            if !urls.isEmpty { return urls }
+        }
+        return (image("736x")?.0).map { [$0] } ?? []
     }
 
     var video: URL? {
