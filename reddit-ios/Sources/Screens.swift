@@ -17,11 +17,6 @@ final class HomeVC: Feed, UISearchBarDelegate {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-        build()
-    }
-
     override func viewDidLoad() {
         super.viewDidLoad()
         bar.placeholder = "Subreddit, search, or paste a link"
