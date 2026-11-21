@@ -1,6 +1,7 @@
 // The screens: home, a post with its comments, the picture viewer, video, signing in, links.
 
 import AVKit
+import SafariServices
 import UIKit
 import WebKit
 
@@ -38,7 +39,13 @@ final class HomeVC: Feed, UISearchBarDelegate {
         let q = (b.text ?? "").trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return }
         b.resignFirstResponder()
-        if let vc = HomeVC.destination(q) { navigationController?.pushViewController(vc, animated: true) }
+        let low = q.lowercased()
+        // r/sub, u/user and links open natively; a word search opens in Safari (Reddit blocks the app's search)
+        if low.hasPrefix("r/") || low.hasPrefix("/r/") || low.hasPrefix("u/") || low.hasPrefix("/u/") || low.contains("reddit.com") || low.contains("redd.it") {
+            if let vc = HomeVC.destination(q) { navigationController?.pushViewController(vc, animated: true) }
+        } else if let enc = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            Safari.open("/search?q=\(enc)&include_over_18=on", from: self)
+        }
     }
 
     /// "r/pics" or "pics" opens it, "u/name" a person, a link its page; anything else is searched.
@@ -185,7 +192,7 @@ final class PostVC: UIViewController, UITextViewDelegate {
                 s.comments = parts.count > 1 ? parts[1].o("data").a("children") : []
                 s.failure = nil
             case .failure(let e):
-                s.failure = e.description
+                s.failure = e.description + "\n\nTap \u{201C}Safari\u{201D} (top right) to read this post with its comments."
             }
             s.render()
         }
@@ -286,9 +293,7 @@ final class PostVC: UIViewController, UITextViewDelegate {
         }
     }
 
-    @objc private func inSafari() {
-        if let u = URL(string: "https://old.reddit.com" + post.permalink) { UIApplication.shared.open(u) }
-    }
+    @objc private func inSafari() { Safari.open(post.permalink, from: self) }
 
     func textView(_ textView: UITextView, shouldInteractWith url: URL, in range: NSRange, interaction: UITextItemInteraction) -> Bool {
         if interaction == .invokeDefaultAction { Router.open(url, from: self) }
@@ -542,4 +547,21 @@ final class MenuDots: UIBarButtonItem {
     }
 
     @objc private func tap() { run() }
+}
+
+
+// MARK: - the real Safari engine
+
+/// Opens a reddit.com path in the iPhone's own Safari engine, which uses your real Safari session
+/// (so comments, search and NSFW work the way they do when you browse Reddit in Safari).
+enum Safari {
+    static func open(_ path: String, from vc: UIViewController) {
+        let p = path.hasPrefix("/") ? path : "/" + path
+        guard let u = URL(string: "https://old.reddit.com" + p) else { return }
+        let s = SFSafariViewController(url: u)
+        s.preferredBarTintColor = .black
+        s.preferredControlTintColor = .white
+        s.dismissButtonStyle = .close
+        vc.present(s, animated: true)
+    }
 }
