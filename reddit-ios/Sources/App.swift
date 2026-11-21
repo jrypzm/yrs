@@ -16,7 +16,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         UINavigationBar.appearance().standardAppearance = bar
         UINavigationBar.appearance().scrollEdgeAppearance = bar
 
-        let nav = UINavigationController(rootViewController: HomeVC())
+        // opens on Reddit's normal homepage (Popular); the ⋯ in the corner opens everything else
+        let home = Lists.sub("popular")
+        let nav = UINavigationController(rootViewController: home)
+        home.navigationItem.rightBarButtonItem = MenuDots { [weak nav] in nav?.pushViewController(HomeVC(), animated: true) }
         let w = UIWindow(frame: UIScreen.main.bounds)
         w.backgroundColor = .black
         w.overrideUserInterfaceStyle = .dark

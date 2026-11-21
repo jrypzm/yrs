@@ -10,7 +10,7 @@ final class HomeVC: Feed, UISearchBarDelegate {
     private let bar = UISearchBar()
 
     init() {
-        super.init("reddit")
+        super.init("Menu")
         NotificationCenter.default.addObserver(self, selector: #selector(build), name: Reddit.signedIn, object: nil)
     }
 
@@ -520,4 +520,26 @@ enum Router {
         if let next = screen(u) { vc.navigationController?.pushViewController(next, animated: true); return }
         UIApplication.shared.open(u)
     }
+}
+
+// MARK: - the ⋯ button
+
+/// Plain three dots (no icon, no background) that run an action when tapped.
+final class MenuDots: UIBarButtonItem {
+    private var run: () -> Void = {}
+
+    convenience init(_ run: @escaping () -> Void) {
+        self.init()
+        self.run = run
+        let b = UIButton(type: .system)
+        b.setTitle("⋯", for: .normal)
+        b.titleLabel?.font = .systemFont(ofSize: 28)
+        b.tintColor = .white
+        b.backgroundColor = .clear
+        b.frame = CGRect(x: 0, y: 0, width: 40, height: 40)
+        b.addTarget(self, action: #selector(tap), for: .touchUpInside)
+        customView = b
+    }
+
+    @objc private func tap() { run() }
 }

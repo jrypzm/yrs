@@ -96,8 +96,34 @@ final class Reddit {
         token(refresh: false) { [weak self] t in
             guard let s = self else { return }
             guard let t = t else { done(.failure(.offline("Couldn't reach Reddit. Pull down to try again."))); return }
-            s.call(path, q, token: t, retry: true, done: done)
+            s.call(path, q, token: t, retry: true) { r in
+                // Reddit refuses the /new listing to app tokens; the same posts come through search, newest first
+                if case .failure(.http(403)) = r, let (fp, fq) = Reddit.newViaSearch(path, q) {
+                    s.call(fp, fq, token: t, retry: true, done: done)
+                } else {
+                    done(r)
+                }
+            }
         }
+    }
+
+    /// "/r/pics/new" → search r/pics sorted by new; the front page's "/new" → all of Reddit, newest.
+    static func newViaSearch(_ path: String, _ q: [String: String]) -> (String, [String: String])? {
+        var p = path
+        while p.count > 1, p.hasSuffix("/") { p.removeLast() }
+        guard p.hasSuffix("/new") else { return nil }
+        var fq = q
+        fq["sort"] = "new"
+        fq["t"] = "all"
+        fq["include_over_18"] = "on"
+        let parts = p.split(separator: "/").map(String.init)
+        if parts.count == 3, parts[0] == "r", !["all", "popular"].contains(parts[1].lowercased()) {
+            fq["q"] = "subreddit:\(parts[1])"
+            fq["restrict_sr"] = "1"
+            return ("/r/\(parts[1])/search", fq)
+        }
+        fq["q"] = "self:yes OR self:no"
+        return ("/search", fq)
     }
 
     private func call(_ path: String, _ q: [String: String], token: String, retry: Bool, done: @escaping (Result<Any, APIError>) -> Void) {
