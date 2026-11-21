@@ -113,7 +113,7 @@ final class Reddit {
             guard let s = self else { return }
             guard let t = t else {
                 if !guest { s.attempt(path, q, guest: true, triedGuest: true, done: done) }
-                else { done(.failure(.offline("Couldn't reach Reddit. Pull down to try again."))) }
+                else { done(.failure(.offline("Couldn't reach Reddit. Pull down to try again.\n\n" + TokenWeb.diag))) }
                 return
             }
             s.call(path, q, token: t, guest: guest, refresh: true) { r in
@@ -236,12 +236,17 @@ final class Reddit {
 /// A hidden web view used only to get or refresh a reddit.com token_v2 cookie, then let go of.
 /// It takes the data store to use: the shared one (your login) or the guest one (logged out).
 final class TokenWeb: NSObject, WKNavigationDelegate {
+    /// What the last token fetch saw, shown in the error so a failure is diagnosable from the phone.
+    static var diag = ""
     private static var active: [TokenWeb] = []
     private var web: WKWebView?
     private var store: WKWebsiteDataStore!
     private var done: (() -> Void)?
     private var poll: Timer?
     private var tries = 0
+    private var loaded = false
+    private var status = 0
+    private var failMsg = ""
 
     static func warmUp(_ store: WKWebsiteDataStore, _ done: @escaping () -> Void) {
         let t = TokenWeb()
@@ -278,9 +283,13 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.stop() }
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { check() }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { check() }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { check() }
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if navigationResponse.isForMainFrame { status = (navigationResponse.response as? HTTPURLResponse)?.statusCode ?? 0 }
+        decisionHandler(.allow)
+    }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { loaded = true; check() }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failMsg = (error as NSError).localizedDescription; check() }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failMsg = (error as NSError).localizedDescription; check() }
 
     private func check() {
         guard poll == nil else { return }
@@ -296,14 +305,18 @@ final class TokenWeb: NSObject, WKNavigationDelegate {
 
     private func stop() {
         poll?.invalidate(); poll = nil
+        let url = web?.url?.host ?? "—"
         web?.navigationDelegate = nil
         web?.stopLoading()
         web?.removeFromSuperview()
         web = nil
         let d = done; done = nil
         TokenWeb.active.removeAll { $0 === self }
-        DispatchQueue.main.async { malloc_zone_pressure_relief(nil, 0) }
-        d?()
+        store.httpCookieStore.getAllCookies { cookies in
+            let names = cookies.filter { $0.domain.hasSuffix("reddit.com") }.map { $0.name }.sorted().joined(separator: ",")
+            TokenWeb.diag = "loaded=\(self.loaded) http=\(self.status) at=\(url)\ncookies: \(names.isEmpty ? "none" : names)\(self.failMsg.isEmpty ? "" : "\nweb: \(self.failMsg)")"
+            DispatchQueue.main.async { malloc_zone_pressure_relief(nil, 0); d?() }
+        }
     }
 }
 
