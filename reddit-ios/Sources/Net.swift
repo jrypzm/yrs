@@ -145,13 +145,27 @@ final class Reddit {
         waiting.append(done)
         guard !loading else { return }
         loading = true
-        mintGuest { [weak self] t, secs in
+        let finish: (String?, TimeInterval) -> Void = { [weak self] t, secs in
             guard let s = self else { return }
             s.cached = t
             s.until = Date().addingTimeInterval(secs)
             s.loading = false
             let w = s.waiting; s.waiting = []
             w.forEach { $0(t) }
+        }
+        // signed in: use your account token (Reddit serves content to it); else a logged-out guest token
+        if isSignedIn {
+            userToken { t in if let t = t { finish(t, 3600) } else { self.mintGuest(finish) } }
+        } else {
+            mintGuest(finish)
+        }
+    }
+
+    /// Your account's bearer token, left in the app by the sign-in page (the `token_v2` cookie).
+    private func userToken(_ done: @escaping (String?) -> Void) {
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            let t = cookies.first { $0.name == "token_v2" && $0.domain.hasSuffix("reddit.com") }?.value
+            DispatchQueue.main.async { done((t?.isEmpty == false) ? t : nil) }
         }
     }
 
@@ -178,10 +192,22 @@ final class Reddit {
         }.resume()
     }
 
-    // no account to sign in or out of in the guest build
-    func signedIn(_ yes: Bool) {}
-    func signOut() {}
-    var isSignedIn: Bool { false }
+    // MARK: signing in (optional — unlocks the feeds Reddit won't serve to a logged-out app)
+
+    var isSignedIn: Bool { UserDefaults.standard.bool(forKey: "signedIn") }
+
+    func signedIn(_ yes: Bool) {
+        UserDefaults.standard.set(yes, forKey: "signedIn")
+        cached = nil
+        NotificationCenter.default.post(name: Reddit.signedIn, object: nil)
+    }
+
+    func signOut() {
+        cached = nil
+        WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
+            self?.signedIn(false)
+        }
+    }
 }
 
 // MARK: - pictures

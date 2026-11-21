@@ -12,9 +12,15 @@ final class HomeVC: Feed, UISearchBarDelegate {
 
     init() {
         super.init("Menu")
+        NotificationCenter.default.addObserver(self, selector: #selector(build), name: Reddit.signedIn, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        build()
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -61,6 +67,22 @@ final class HomeVC: Feed, UISearchBarDelegate {
             rows.append(Item(title: "r/" + s, detail: "★ saved", open: { Lists.sub(s) }))
         }
         rows.append(Item(title: "Open a Reddit link", detail: "Paste a link to a post, subreddit or person.", action: { [weak self] in self?.openLink() }))
+        if Reddit.shared.isSignedIn {
+            rows.append(Item(title: "Your front page", detail: "From the subreddits you follow", open: { Lists.front() }))
+            rows.append(Item(title: "Subreddits you follow", open: { Lists.feed("Following") { _ in ("/subreddits/mine/subscriber", [:]) } }))
+            rows.append(Item(title: "Sign out", action: { [weak self] in
+                let a = UIAlertController(title: "Sign out?", message: nil, preferredStyle: .alert)
+                a.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+                a.addAction(UIAlertAction(title: "Sign out", style: .destructive) { _ in Reddit.shared.signOut() })
+                self?.present(a, animated: true)
+            }))
+        } else {
+            rows.append(Item(title: "Sign in", detail: "Unlocks your front page, your subs, and the feeds Reddit won't show a logged-out app. Your password goes only to Reddit.", action: { [weak self] in
+                let nav = UINavigationController(rootViewController: LoginVC())
+                nav.modalPresentationStyle = .fullScreen
+                self?.present(nav, animated: true)
+            }))
+        }
         show(rows)
     }
 
@@ -463,6 +485,63 @@ final class MenuDots: UIBarButtonItem {
     @objc private func tap() { run() }
 }
 
+
+// MARK: - signing in
+
+/// Reddit's own sign-in page. Your password goes only to reddit.com; the app keeps no copy.
+/// After this, every request is a plain fast HTTP call using your account token — no web view.
+final class LoginVC: UIViewController, WKNavigationDelegate {
+    private var web: WKWebView!
+    private var done = false
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "Sign in to Reddit"
+        view.backgroundColor = .black
+        let c = WKWebViewConfiguration()
+        c.websiteDataStore = .default()
+        c.applicationNameForUserAgent = safariSuffix
+        web = WKWebView(frame: view.bounds, configuration: c)
+        web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        web.navigationDelegate = self
+        view.addSubview(web)
+        web.load(URLRequest(url: URL(string: "https://www.reddit.com/login/")!))
+        navigationItem.leftBarButtonItem = UIBarButtonItem(title: "Cancel", style: .plain, target: self, action: #selector(cancel))
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Done", style: .done, target: self, action: #selector(tapDone))
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        whoAmI { [weak self] name in if name != nil { self?.finish() } }
+    }
+
+    private func whoAmI(_ then: @escaping (String?) -> Void) {
+        let js = "try { const r = await fetch('/api/me.json', {credentials:'include'}); const j = await r.json(); return (j && j.data && j.data.name) ? j.data.name : ''; } catch(e) { return ''; }"
+        web.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { result in
+            if case .success(let v) = result, let name = v as? String, !name.isEmpty { then(name) } else { then(nil) }
+        }
+    }
+
+    @objc private func cancel() { dismiss(animated: true) }
+
+    @objc private func tapDone() {
+        whoAmI { [weak self] name in
+            if name != nil { self?.finish() } else {
+                let a = UIAlertController(title: "Not signed in yet", message: "Log in on this page until you see your own Reddit, then tap Done.", preferredStyle: .alert)
+                a.addAction(UIAlertAction(title: "OK", style: .default))
+                self?.present(a, animated: true)
+            }
+        }
+    }
+
+    private func finish() {
+        guard !done else { return }
+        done = true
+        Reddit.shared.signedIn(true)
+        web.navigationDelegate = nil
+        web = nil
+        dismiss(animated: true)
+    }
+}
 
 // MARK: - the real Safari engine
 
