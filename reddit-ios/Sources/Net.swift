@@ -91,20 +91,21 @@ final class Reddit {
     // MARK: reading
 
     func get(_ path: String, _ q: [String: String] = [:], done: @escaping (Result<Any, APIError>) -> Void) {
-        // Comment PAGES are confirmed: oauth refuses them for this app, old.reddit serves them with
-        // your cookies — so go straight there (no wasted call, keeps them as quick as they are).
-        if isSignedIn, Reddit.isCommentPage(path) {
-            viaOldReddit(path, q, done: done)
-            return
-        }
-        // New, search and "load more comments": neither oauth nor old.reddit will serve these to the
-        // app, but your logged-in browser sees them fine — so fetch reddit.com's own .json through a
-        // real web view carrying your session. If that ever fails, fall back to the old oauth path.
-        if isSignedIn, Reddit.needsWeb(path) {
-            WebReddit.shared.get(path, q) { [weak self] r in
-                if case .success = r { done(r) } else { self?.oauthGet(path, q, done: done) }
+        if isSignedIn {
+            // Comment pages and subreddit search: old.reddit's own .json serves these to the app with
+            // your cookies, so go straight there (quick, already proven to work).
+            if Reddit.isCommentPage(path) || Reddit.isSubredditSearch(path) {
+                viaOldReddit(path, q, done: done)
+                return
             }
-            return
+            // New, post search and "load more comments": refused to the app on every plain request,
+            // but your logged-in browser sees them — so read old.reddit's .json through a real web
+            // view that carries your session and clears the bot-check. No oauth fallback: oauth 403s
+            // these too, and falling back would just hide the web view's real result.
+            if Reddit.needsWeb(path) {
+                WebReddit.shared.get(path, q, done: done)
+                return
+            }
         }
         // Everything else (feeds) asks oauth with your token; call() falls back to old.reddit if refused.
         oauthGet(path, q, done: done)
@@ -118,8 +119,16 @@ final class Reddit {
         return p.contains("/comments/") || p.hasPrefix("comments/")
     }
 
-    /// New, search, and the "load more comments" API — blocked on both oauth and old.reddit, so these
-    /// go through the logged-in web view (your real browser session) instead.
+    /// Subreddit search — old.reddit serves this to the app already, so it doesn't need the web view.
+    static func isSubredditSearch(_ path: String) -> Bool {
+        var p = path
+        while p.hasPrefix("/") { p.removeFirst() }
+        if p.hasSuffix(".json") { p.removeLast(5) }
+        return p == "subreddits/search"
+    }
+
+    /// New, post search, and the "load more comments" API — blocked on both oauth and old.reddit's
+    /// plain .json, so these go through the logged-in web view (your real browser session) instead.
     static func needsWeb(_ path: String) -> Bool {
         var p = path
         while p.hasPrefix("/") { p.removeFirst() }
@@ -401,8 +410,8 @@ final class WebReddit: NSObject, WKNavigationDelegate {
         keyWindow()?.addSubview(w)                   // attached to the window so iOS keeps it running
         keyWindow()?.sendSubviewToBack(w)
         web = w
-        w.load(URLRequest(url: URL(string: "https://www.reddit.com/")!))
-        // reddit.com runs a JS bot-check as it loads; wait for the page to FINISH (so that check has
+        w.load(URLRequest(url: URL(string: "https://old.reddit.com/")!))
+        // reddit runs a JS bot-check as it loads; wait for the page to FINISH (so that check has
         // passed and dropped its cookie) before we fetch. A long stop, in case load never fully settles.
         DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in self?.markReady() }
     }
@@ -433,7 +442,7 @@ final class WebReddit: NSObject, WKNavigationDelegate {
         while p.count > 1, p.hasSuffix("/") { p.removeLast() }
         if p.hasSuffix(".json") { p.removeLast(5) }
         var c = URLComponents()
-        c.scheme = "https"; c.host = "www.reddit.com"; c.path = (p.isEmpty ? "/" : p) + ".json"
+        c.scheme = "https"; c.host = "old.reddit.com"; c.path = (p.isEmpty ? "/" : p) + ".json"
         c.queryItems = [URLQueryItem(name: "raw_json", value: "1")] + q.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
         guard let u = c.url else { done(.failure(.bad)); return }
         // fetch from inside the page: same-origin, your cookies, the clearance the page already earned
@@ -451,7 +460,7 @@ final class WebReddit: NSObject, WKNavigationDelegate {
                     // the page's bot-check may still be settling; wait a moment and try once more
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { self.doFetch(path, q, attempt: 1, done: done) }
                 } else {
-                    Reddit.diag = "web www.reddit\(c.path) http=\(code) \(body.prefix(60).replacingOccurrences(of: "\n", with: " "))"
+                    Reddit.diag = "web old.reddit\(c.path) http=\(code) \(body.prefix(70).replacingOccurrences(of: "\n", with: " "))"
                     done(.failure(.offline("Reddit won't show this.\n\n" + Reddit.diag)))
                 }
             }
