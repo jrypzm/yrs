@@ -58,8 +58,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
-        // pictures are let go of; memory goes back to iOS
+        // pictures are let go of; memory goes back to iOS. The disk copies stay (trimmed to a cap).
         Images.forget()
+        Images.trimDisk()
         malloc_zone_pressure_relief(nil, 0)
     }
 
