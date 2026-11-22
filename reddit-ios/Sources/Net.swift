@@ -421,7 +421,7 @@ final class WebReddit: NSObject, WKNavigationDelegate {
 
     func get(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
         DispatchQueue.main.async {
-            let run = { [weak self] in self?.doFetch(path, q, done: done) }
+            let run: () -> Void = { self.doFetch(path, q, done: done) }   // shared singleton, safe to hold
             self.ensure()
             if self.ready { run() } else { self.pending.append(run) }
         }
