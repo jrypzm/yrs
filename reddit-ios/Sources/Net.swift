@@ -14,7 +14,7 @@ enum APIError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .http(let c) where c == 401 || c == 403: return "Reddit won't show this (\(c)): private, banned, or you need to sign in. Pull down to try again."
+        case .http(let c) where c == 401 || c == 403: return "Reddit won't show this (\(c)).\n\n" + Reddit.diag
         case .http(404): return "Not found."
         case .http(429): return "Reddit says too many requests. Wait a minute and pull down to try again."
         case .http(let c): return "Reddit answered \(c)."
@@ -184,8 +184,7 @@ final class Reddit {
                 let r: Result<Any, APIError>
                 if (200 ..< 300).contains(code), let d = data, let j = try? JSONSerialization.jsonObject(with: d) { r = .success(j) }
                 else {
-                    let body = data.flatMap { String(data: $0.prefix(70), encoding: .utf8) } ?? ""
-                    Reddit.diag = "token=\(Reddit.tokenKind) oauth=\(Reddit.lastOAuthCode) · old.reddit \(c.path): http=\(code) session=\(hasSession ? "yes" : "no") \(body.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces))"
+                    Reddit.diag = "token=\(Reddit.tokenKind) \(Reddit.mintInfo) oauth=\(Reddit.lastOAuthCode) · old.reddit \(c.path) http=\(code) session=\(hasSession ? "yes" : "no")"
                     r = .failure(.offline("Reddit won't show this.\n\n" + Reddit.diag))
                 }
                 DispatchQueue.main.async { done(r) }
@@ -203,6 +202,7 @@ final class Reddit {
     /// Breadcrumbs for the diagnostic line: which token we're on, and what oauth last answered.
     static var tokenKind = "?"
     static var lastOAuthCode = 0
+    static var mintInfo = "mint=?"
     private var cached: String?
     private var until = Date.distantPast
     private var loading = false
@@ -239,11 +239,16 @@ final class Reddit {
         WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
             let mine = cookies.filter { $0.domain.hasSuffix("reddit.com") }
             if let t = mine.first(where: { $0.name == "token_v2" })?.value, !t.isEmpty {
+                Reddit.mintInfo = "mint=cookie"
                 DispatchQueue.main.async { done(t) }
                 return
             }
             // no token_v2 (old.reddit login sets reddit_session): exchange the cookies for a token
-            guard mine.contains(where: { $0.name == "reddit_session" }) else { DispatchQueue.main.async { done(nil) }; return }
+            guard mine.contains(where: { $0.name == "reddit_session" }) else {
+                Reddit.mintInfo = "mint=no-session(cookies:\(mine.map { $0.name }.joined(separator: ",")))"
+                DispatchQueue.main.async { done(nil) }
+                return
+            }
             let header = mine.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
             var req = URLRequest(url: URL(string: "https://accounts.reddit.com/api/access_token")!)
             req.httpMethod = "POST"
@@ -252,9 +257,17 @@ final class Reddit {
             req.setValue(appUA, forHTTPHeaderField: "User-Agent")
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try? JSONSerialization.data(withJSONObject: ["scopes": ["*"]])
-            self.session.dataTask(with: req) { data, _, _ in
+            self.session.dataTask(with: req) { data, resp, _ in
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 let t = (data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? JSON)?["access_token"] as? String
-                DispatchQueue.main.async { done((t?.isEmpty == false) ? t : nil) }
+                if let t = t, !t.isEmpty {
+                    Reddit.mintInfo = "mint=\(code)ok"
+                    DispatchQueue.main.async { done(t) }
+                } else {
+                    let body = data.flatMap { String(data: $0.prefix(50), encoding: .utf8) } ?? ""
+                    Reddit.mintInfo = "mint=\(code) " + body.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+                    DispatchQueue.main.async { done(nil) }
+                }
             }.resume()
         }
     }
