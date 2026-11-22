@@ -402,15 +402,15 @@ final class WebReddit: NSObject, WKNavigationDelegate {
         keyWindow()?.sendSubviewToBack(w)
         web = w
         w.load(URLRequest(url: URL(string: "https://www.reddit.com/")!))
-        // don't wait forever for a full render; the page's session is usable well before that
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.markReady() }
+        // reddit.com runs a JS bot-check as it loads; wait for the page to FINISH (so that check has
+        // passed and dropped its cookie) before we fetch. A long stop, in case load never fully settles.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in self?.markReady() }
     }
 
-    func webView(_ w: WKWebView, didCommit navigation: WKNavigation!) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.markReady() }
+    func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) {
+        // give the bot-check script a beat to run after the HTML lands, then start serving
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.markReady() }
     }
-
-    func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) { markReady() }
 
     private func markReady() {
         guard !ready, web != nil else { return }
@@ -421,13 +421,13 @@ final class WebReddit: NSObject, WKNavigationDelegate {
 
     func get(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
         DispatchQueue.main.async {
-            let run: () -> Void = { self.doFetch(path, q, done: done) }   // shared singleton, safe to hold
+            let run: () -> Void = { self.doFetch(path, q, attempt: 0, done: done) }   // singleton, safe to hold
             self.ensure()
             if self.ready { run() } else { self.pending.append(run) }
         }
     }
 
-    private func doFetch(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
+    private func doFetch(_ path: String, _ q: [String: String], attempt: Int, done: @escaping (Result<Any, APIError>) -> Void) {
         guard let web = web else { done(.failure(.offline("Reddit won't show this. (web view not ready)"))); return }
         var p = path.hasPrefix("/") ? path : "/" + path
         while p.count > 1, p.hasSuffix("/") { p.removeLast() }
@@ -440,14 +440,16 @@ final class WebReddit: NSObject, WKNavigationDelegate {
         let js = "try { const r = await fetch(u, {credentials:'include', headers:{'Accept':'application/json'}}); return r.status + '\\u0001' + (await r.text()); } catch(e) { return '0\\u0001' + e; }"
         web.callAsyncJavaScript(js, arguments: ["u": u.absoluteString], in: nil, in: .page) { res in
             DispatchQueue.main.async {
-                guard case .success(let v) = res, let s = v as? String, let sep = s.firstIndex(of: "\u{1}") else {
-                    Reddit.diag = "web \(c.path): no reply"
-                    done(.failure(.offline("Reddit won't show this.\n\n" + Reddit.diag))); return
+                var code = 0, body = ""
+                if case .success(let v) = res, let s = v as? String, let sep = s.firstIndex(of: "\u{1}") {
+                    code = Int(s[..<sep]) ?? 0
+                    body = String(s[s.index(after: sep)...])
                 }
-                let code = Int(s[..<sep]) ?? 0
-                let body = String(s[s.index(after: sep)...])
                 if (200 ..< 300).contains(code), let d = body.data(using: .utf8), let j = try? JSONSerialization.jsonObject(with: d) {
                     done(.success(j))
+                } else if attempt == 0 {
+                    // the page's bot-check may still be settling; wait a moment and try once more
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { self.doFetch(path, q, attempt: 1, done: done) }
                 } else {
                     Reddit.diag = "web www.reddit\(c.path) http=\(code) \(body.prefix(60).replacingOccurrences(of: "\n", with: " "))"
                     done(.failure(.offline("Reddit won't show this.\n\n" + Reddit.diag)))
