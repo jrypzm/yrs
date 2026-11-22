@@ -93,10 +93,8 @@ final class Reddit {
     func get(_ path: String, _ q: [String: String] = [:], done: @escaping (Result<Any, APIError>) -> Void) {
         // New and comments: oauth always refuses these, so go straight to old.reddit (no wasted call)
         if isSignedIn, Reddit.needsOldReddit(path) {
-            viaOldReddit(path, q) { r in
-                if case .success = r { done(r) }
-                else { self.oauthGet(path, q, done: done) }   // if the cookie route fails, still try oauth
-            }
+            // oauth always refuses these; old.reddit is the only route, so show its real result
+            viaOldReddit(path, q, done: done)
             return
         }
         oauthGet(path, q, done: done)
@@ -178,11 +176,16 @@ final class Reddit {
             req.setValue(safariUA, forHTTPHeaderField: "User-Agent")
             req.setValue("application/json", forHTTPHeaderField: "Accept")
             if !header.isEmpty { req.setValue(header, forHTTPHeaderField: "Cookie") }
+            let hasSession = cookies.contains { $0.name == "reddit_session" && $0.domain.hasSuffix("reddit.com") }
             self.session.dataTask(with: req) { data, resp, _ in
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 let r: Result<Any, APIError>
                 if (200 ..< 300).contains(code), let d = data, let j = try? JSONSerialization.jsonObject(with: d) { r = .success(j) }
-                else { r = .failure(.http(code)) }
+                else {
+                    let body = data.flatMap { String(data: $0.prefix(90), encoding: .utf8) } ?? ""
+                    Reddit.diag = "old.reddit \(c.path): http=\(code) session=\(hasSession ? "yes" : "no") \(body.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces))"
+                    r = .failure(.offline("Reddit won't show this.\n\n" + Reddit.diag))
+                }
                 DispatchQueue.main.async { done(r) }
             }.resume()
         }
