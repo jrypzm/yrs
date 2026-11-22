@@ -614,14 +614,14 @@ enum CommentDoc {
 /// morechildren, your cookies) and lays them out like any other thread, in the app.
 final class MoreVC: UIViewController, UITextViewDelegate {
     private let linkID: String
-    private let children: [String]
+    private let childIDs: [String]
     private let tv = UITextView()
     private var things: [JSON] = []
     private var note: String?
 
     init(linkID: String, children: [String]) {
         self.linkID = linkID
-        self.children = children
+        self.childIDs = children
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -644,7 +644,7 @@ final class MoreVC: UIViewController, UITextViewDelegate {
     }
 
     private func load() {
-        let q = ["api_type": "json", "link_id": linkID, "children": children.prefix(100).joined(separator: ","), "limit_children": "false"]
+        let q = ["api_type": "json", "link_id": linkID, "children": childIDs.prefix(100).joined(separator: ","), "limit_children": "false"]
         Reddit.shared.get("/api/morechildren", q) { [weak self] r in
             guard let s = self else { return }
             switch r {
