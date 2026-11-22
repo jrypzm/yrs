@@ -136,6 +136,7 @@ final class PostVC: UIViewController, UITextViewDelegate {
     override func loadView() {
         tv.backgroundColor = .black
         tv.isEditable = false
+        tv.isSelectable = true          // required for the r/sub, u/author and reply links to be tappable
         tv.indicatorStyle = .white
         tv.dataDetectorTypes = []
         tv.delegate = self
@@ -178,7 +179,7 @@ final class PostVC: UIViewController, UITextViewDelegate {
 
     @objc private func load() {
         guard !post.permalink.isEmpty else { return }
-        Reddit.shared.get(post.permalink, ["limit": "100", "depth": "8"]) { [weak self] r in
+        Reddit.shared.get(post.permalink, ["limit": "50", "depth": "5"]) { [weak self] r in
             guard let s = self else { return }
             s.tv.refreshControl?.endRefreshing()
             switch r {

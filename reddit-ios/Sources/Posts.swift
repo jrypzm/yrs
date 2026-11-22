@@ -163,8 +163,14 @@ enum Lists {
     }
 
     static func search(_ q: String) -> Feed {
-        feed(q, choices: ["Subreddits", "Posts"]) { c in
-            c == 0 ? ("/subreddits/search", ["q": q]) : ("/search", ["q": q, "sort": "relevance"])
+        // sort posts by relevance/hot/top/new, or switch to finding subreddits (Reddit search has no "rising")
+        let tabs = ["Relevant", "Hot", "Top", "New", "Subs"]
+        return feed(q, choices: tabs) { c in
+            if c == 4 { return ("/subreddits/search", ["q": q]) }
+            let sort = ["relevance", "hot", "top", "new"][c]
+            var p = ["q": q, "sort": sort]
+            if sort == "top" { p["t"] = "all" }
+            return ("/search", p)
         }
     }
 }

@@ -381,7 +381,15 @@ final class WebReddit: NSObject, WKNavigationDelegate {
     static let shared = WebReddit()
     private var web: WKWebView?
     private var ready = false
+    private var creating = false
     private var pending: [() -> Void] = []
+
+    // Block the heavy stuff the web view would otherwise render — we only need the page's HTML and the
+    // bot-check script, never its images/fonts/styles. This keeps its WebContent process tiny so iOS
+    // doesn't kill it on an older iPhone. (Our fetches get the raw HTML regardless of this.)
+    private static let blockRules = """
+    [{"trigger":{"url-filter":".*","resource-type":["image","media","font","style-sheet"]},"action":{"type":"block"}}]
+    """
 
     private func keyWindow() -> UIWindow? {
         UIApplication.shared.connectedScenes
@@ -392,31 +400,53 @@ final class WebReddit: NSObject, WKNavigationDelegate {
 
     /// Start loading the web view ahead of time (called at launch), so the first New/search is instant.
     func warmup() {
-        // a beat after launch so the key window exists, then load in the background
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.ensure() }
+        // a few seconds after launch (so the first feed loads smoothly first), then load in the background
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.ensure() }
     }
 
     private func ensure() {
+        guard web == nil, !creating else { return }
+        creating = true
+        // compile the "block media" rules, then build the web view with them (keeps its process light).
+        // If the rule store isn't available, build without them rather than never building at all.
+        guard let store = WKContentRuleListStore.default() else { build(nil); return }
+        store.compileContentRuleList(forIdentifier: "yrs-light", encodedContentRuleList: WebReddit.blockRules) { [weak self] list, _ in
+            self?.build(list)
+        }
+    }
+
+    private func build(_ rules: WKContentRuleList?) {
+        creating = false
         guard web == nil else { return }
         let c = WKWebViewConfiguration()
-        c.websiteDataStore = .default()              // the same cookie jar your sign-in used
+        c.websiteDataStore = .default()                 // the same cookie jar your sign-in used
         c.applicationNameForUserAgent = safariSuffix
+        if let rules = rules { c.userContentController.add(rules) }
         let w = WKWebView(frame: CGRect(x: 0, y: 0, width: 2, height: 2), configuration: c)
         w.navigationDelegate = self
         w.isUserInteractionEnabled = false
         w.alpha = 0.01
-        keyWindow()?.addSubview(w)                   // attached to the window so iOS keeps it running
+        keyWindow()?.addSubview(w)                      // attached to the window so iOS keeps it running
         keyWindow()?.sendSubviewToBack(w)
         web = w
-        w.load(URLRequest(url: URL(string: "https://old.reddit.com/")!))
-        // reddit runs a JS bot-check as it loads; wait for the page to FINISH (so that check has
-        // passed and dropped its cookie) before we fetch. A stop in case load never fully settles.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.markReady() }
+        // a tiny subreddit, with images/styles blocked, so the page is cheap to hold open
+        w.load(URLRequest(url: URL(string: "https://old.reddit.com/r/test/")!))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 9) { [weak self] in self?.markReady() }
     }
 
     func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) {
         // the page finished (bot-check cleared) — start serving almost immediately
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.markReady() }
+    }
+
+    /// If iOS kills the web view's content process (memory pressure on an older phone), rebuild it so
+    /// New/search/join keep working instead of silently dying.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        ready = false
+        webView.removeFromSuperview()
+        web = nil
+        creating = false
+        ensure()
     }
 
     private func markReady() {
