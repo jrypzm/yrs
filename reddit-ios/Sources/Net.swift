@@ -161,11 +161,29 @@ final class Reddit {
         }
     }
 
-    /// Your account's bearer token, left in the app by the sign-in page (the `token_v2` cookie).
+    /// Your account's bearer token from the sign-in: the `token_v2` cookie if present, otherwise
+    /// minted from your login cookies (the way Reddit's own site turns a session into a token).
     private func userToken(_ done: @escaping (String?) -> Void) {
         WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-            let t = cookies.first { $0.name == "token_v2" && $0.domain.hasSuffix("reddit.com") }?.value
-            DispatchQueue.main.async { done((t?.isEmpty == false) ? t : nil) }
+            let mine = cookies.filter { $0.domain.hasSuffix("reddit.com") }
+            if let t = mine.first(where: { $0.name == "token_v2" })?.value, !t.isEmpty {
+                DispatchQueue.main.async { done(t) }
+                return
+            }
+            // no token_v2 (old.reddit login sets reddit_session): exchange the cookies for a token
+            guard mine.contains(where: { $0.name == "reddit_session" }) else { DispatchQueue.main.async { done(nil) }; return }
+            let header = mine.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+            var req = URLRequest(url: URL(string: "https://accounts.reddit.com/api/access_token")!)
+            req.httpMethod = "POST"
+            req.setValue("Basic " + Data("\(Reddit.clientID):".utf8).base64EncodedString(), forHTTPHeaderField: "Authorization")
+            req.setValue(header, forHTTPHeaderField: "Cookie")
+            req.setValue(appUA, forHTTPHeaderField: "User-Agent")
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["scopes": ["*"]])
+            self.session.dataTask(with: req) { data, _, _ in
+                let t = (data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? JSON)?["access_token"] as? String
+                DispatchQueue.main.async { done((t?.isEmpty == false) ? t : nil) }
+            }.resume()
         }
     }
 

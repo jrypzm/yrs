@@ -500,7 +500,8 @@ final class LoginVC: UIViewController, WKNavigationDelegate {
         web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         web.navigationDelegate = self
         view.addSubview(web)
-        web.load(URLRequest(url: URL(string: "https://www.reddit.com/login/")!))
+        // old.reddit's login is a light HTML form that loads fast on iOS 15 (the new one hangs)
+        web.load(URLRequest(url: URL(string: "https://old.reddit.com/login/")!))
         navigationItem.leftBarButtonItem = UIBarButtonItem(title: "Cancel", style: .plain, target: self, action: #selector(cancel))
         navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Done", style: .done, target: self, action: #selector(tapDone))
     }
