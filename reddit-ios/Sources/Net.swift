@@ -91,13 +91,23 @@ final class Reddit {
     // MARK: reading
 
     func get(_ path: String, _ q: [String: String] = [:], done: @escaping (Result<Any, APIError>) -> Void) {
-        // New and comments: oauth always refuses these, so go straight to old.reddit (no wasted call)
-        if isSignedIn, Reddit.needsOldReddit(path) {
-            // oauth always refuses these; old.reddit is the only route, so show its real result
+        // Comment PAGES are confirmed: oauth refuses them for this app, old.reddit serves them with
+        // your cookies — so go straight there (no wasted call, keeps them as quick as they are).
+        if isSignedIn, Reddit.isCommentPage(path) {
             viaOldReddit(path, q, done: done)
             return
         }
+        // Everything else (feeds, /new, /search, the comment API) asks oauth first with your account
+        // token; call() falls back to old.reddit only if oauth refuses.
         oauthGet(path, q, done: done)
+    }
+
+    /// A single post's comment page (…/comments/<id>…) — the one thing old.reddit serves but oauth won't.
+    static func isCommentPage(_ path: String) -> Bool {
+        var p = path
+        while p.hasPrefix("/") { p.removeFirst() }
+        if p.hasSuffix(".json") { p.removeLast(5) }
+        return p.contains("/comments/") || p.hasPrefix("comments/")
     }
 
     private func oauthGet(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
@@ -106,19 +116,6 @@ final class Reddit {
             guard let t = t else { done(.failure(.offline("Couldn't reach Reddit. Pull down to try again.\n\n" + Reddit.diag))); return }
             s.call(path, q, token: t, refresh: true, done: done)
         }
-    }
-
-    /// Everything oauth refuses for a logged-out-style app id — /new, comment pages, search, and
-    /// "load more comments" — read the way your browser does: old.reddit's .json with your cookies.
-    static func needsOldReddit(_ path: String) -> Bool {
-        var p = path
-        while p.hasPrefix("/") { p.removeFirst() }
-        while p.count > 1, p.hasSuffix("/") { p.removeLast() }
-        if p.hasSuffix(".json") { p.removeLast(5) }
-        return p == "new" || p.hasSuffix("/new")
-            || p.contains("/comments/") || p.hasPrefix("comments/")
-            || p == "search" || p.hasSuffix("/search")
-            || p == "api/morechildren"
     }
 
     /// Gets the guest token ready at launch, so the first feed doesn't wait for it.
@@ -131,6 +128,7 @@ final class Reddit {
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         session.dataTask(with: req) { data, resp, err in
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if resp as? HTTPURLResponse != nil { Reddit.lastOAuthCode = code }
             if (resp as? HTTPURLResponse) == nil, let err = err {
                 DispatchQueue.main.async { done(.failure(.offline((err as NSError).code == NSURLErrorNotConnectedToInternet ? "No internet connection." : err.localizedDescription))) }
                 return
@@ -186,8 +184,8 @@ final class Reddit {
                 let r: Result<Any, APIError>
                 if (200 ..< 300).contains(code), let d = data, let j = try? JSONSerialization.jsonObject(with: d) { r = .success(j) }
                 else {
-                    let body = data.flatMap { String(data: $0.prefix(90), encoding: .utf8) } ?? ""
-                    Reddit.diag = "old.reddit \(c.path): http=\(code) session=\(hasSession ? "yes" : "no") \(body.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces))"
+                    let body = data.flatMap { String(data: $0.prefix(70), encoding: .utf8) } ?? ""
+                    Reddit.diag = "token=\(Reddit.tokenKind) oauth=\(Reddit.lastOAuthCode) · old.reddit \(c.path): http=\(code) session=\(hasSession ? "yes" : "no") \(body.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces))"
                     r = .failure(.offline("Reddit won't show this.\n\n" + Reddit.diag))
                 }
                 DispatchQueue.main.async { done(r) }
@@ -202,6 +200,9 @@ final class Reddit {
     /// Reddit's mobile-site app id (public, no secret); used only to ask for a logged-out token.
     private static let clientID = "ohXpoqrZYub1kg"
     static var diag = ""
+    /// Breadcrumbs for the diagnostic line: which token we're on, and what oauth last answered.
+    static var tokenKind = "?"
+    static var lastOAuthCode = 0
     private var cached: String?
     private var until = Date.distantPast
     private var loading = false
@@ -222,8 +223,12 @@ final class Reddit {
         }
         // signed in: use your account token (Reddit serves content to it); else a logged-out guest token
         if isSignedIn {
-            userToken { t in if let t = t { finish(t, 3600) } else { self.mintGuest(finish) } }
+            userToken { t in
+                if let t = t { Reddit.tokenKind = "account"; finish(t, 3600) }
+                else { Reddit.tokenKind = "guest(mint-failed)"; self.mintGuest(finish) }
+            }
         } else {
+            Reddit.tokenKind = "guest"
             mintGuest(finish)
         }
     }
