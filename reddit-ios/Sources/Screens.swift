@@ -576,23 +576,15 @@ enum CommentDoc {
         let depth = j.i("depth")
         if kind == "more" {
             d.indent = indent(depth, baseDepth)
-            let kids = (j["children"] as? [String]) ?? []
-            let n = j.i("count")
-            let label: String
-            let dest: URL?
-            if kids.isEmpty {
-                // depth-limited "continue this thread": open that comment's own page (its full replies)
-                let parent = j.s("parent_id")
-                let cid = parent.hasPrefix("t1_") ? String(parent.dropFirst(3)) : ""
-                let post = linkID.hasPrefix("t3_") ? String(linkID.dropFirst(3)) : ""
-                label = "→ continue this thread"
-                dest = (cid.isEmpty || post.isEmpty) ? nil : URL(string: "https://old.reddit.com/comments/\(post)/_/\(cid)")
-            } else {
-                let shown = n > 0 ? count(n) : "\(kids.count)"
-                label = "→ \(shown) more " + (n == 1 ? "reply" : "replies")
-                dest = URL(string: "yrsmore:\(linkID)/\(kids.prefix(100).joined(separator: ","))")
-            }
-            if let u = dest {
+            // Reddit's "load more" API (morechildren) is one of the blocked endpoints, so instead open
+            // the parent comment's own page — a comment permalink, which old.reddit still serves — and
+            // it carries that whole sub-conversation (the collapsed replies included).
+            let parent = j.s("parent_id")
+            let cid = parent.hasPrefix("t1_") ? String(parent.dropFirst(3)) : ""
+            let post = linkID.hasPrefix("t3_") ? String(linkID.dropFirst(3)) : ""
+            if !cid.isEmpty, !post.isEmpty, let u = URL(string: "https://old.reddit.com/comments/\(post)/_/\(cid)") {
+                let n = j.i("count")
+                let label = n > 0 ? "→ \(count(n)) more " + (n == 1 ? "reply" : "replies") : "→ continue this thread"
                 d.add(NSAttributedString(string: label, attributes: [.font: Style.body, .foregroundColor: Style.link, .link: u]))
                 d.gap(6)
             }

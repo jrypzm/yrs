@@ -134,7 +134,7 @@ final class Reddit {
         while p.hasPrefix("/") { p.removeFirst() }
         while p.count > 1, p.hasSuffix("/") { p.removeLast() }
         if p.hasSuffix(".json") { p.removeLast(5) }
-        return p == "new" || p.hasSuffix("/new") || p == "search" || p.hasSuffix("/search") || p == "api/morechildren"
+        return p == "new" || p.hasSuffix("/new") || p == "search" || p.hasSuffix("/search")
     }
 
     private func oauthGet(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
@@ -441,31 +441,113 @@ final class WebReddit: NSObject, WKNavigationDelegate {
         var p = path.hasPrefix("/") ? path : "/" + path
         while p.count > 1, p.hasSuffix("/") { p.removeLast() }
         if p.hasSuffix(".json") { p.removeLast(5) }
+        // the HTML page (NOT .json) — Reddit still serves this to a real browser, and old.reddit
+        // renders ~25 posts right in the markup, where /new.json gets the 403 block page.
         var c = URLComponents()
-        c.scheme = "https"; c.host = "old.reddit.com"; c.path = (p.isEmpty ? "/" : p) + ".json"
-        c.queryItems = [URLQueryItem(name: "raw_json", value: "1")] + q.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
+        c.scheme = "https"; c.host = "old.reddit.com"; c.path = p.isEmpty ? "/" : p
+        var items: [URLQueryItem] = []
+        for (k, v) in q.sorted(by: { $0.key < $1.key }) where k != "raw_json" && k != "limit" {
+            items.append(URLQueryItem(name: k, value: v))
+        }
+        if !items.isEmpty { c.queryItems = items }
         guard let u = c.url else { done(.failure(.bad)); return }
-        // fetch from inside the page: same-origin, your cookies, the clearance the page already earned
-        let js = "try { const r = await fetch(u, {credentials:'include', headers:{'Accept':'application/json'}}); return r.status + '\\u0001' + (await r.text()); } catch(e) { return '0\\u0001' + e; }"
-        web.callAsyncJavaScript(js, arguments: ["u": u.absoluteString], in: nil, in: .page) { res in
+        web.callAsyncJavaScript(WebReddit.scrapeJS, arguments: ["u": u.absoluteString], in: nil, in: .page) { res in
             DispatchQueue.main.async {
-                var code = 0, body = ""
-                if case .success(let v) = res, let s = v as? String, let sep = s.firstIndex(of: "\u{1}") {
-                    code = Int(s[..<sep]) ?? 0
-                    body = String(s[s.index(after: sep)...])
+                var out = ""
+                if case .success(let v) = res, let s = v as? String { out = s }
+                if out.hasPrefix("{"), let d = out.data(using: .utf8),
+                   let j = try? JSONSerialization.jsonObject(with: d) as? JSON {
+                    let kids = j.o("data").a("children").count
+                    if kids > 0 { done(.success(j)); return }
+                    // zero posts: a genuinely empty page, or the markup changed / got challenged
+                    if attempt > 0 {
+                        let dg = j["_diag"] as? JSON ?? [:]
+                        Reddit.diag = "web old.reddit\(c.path): 0 posts things=\(dg.i("things")) blocked=\(dg.b("blocked")) len=\(dg.i("len"))"
+                        done(.failure(.offline("Reddit won't show this.\n\n" + Reddit.diag)))
+                        return
+                    }
                 }
-                if (200 ..< 300).contains(code), let d = body.data(using: .utf8), let j = try? JSONSerialization.jsonObject(with: d) {
-                    done(.success(j))
-                } else if attempt == 0 {
-                    // the page's bot-check may still be settling; wait a moment and try once more
+                if attempt == 0 {
+                    // page's bot-check may still be settling, or it was mid-load — wait and retry once
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { self.doFetch(path, q, attempt: 1, done: done) }
                 } else {
-                    Reddit.diag = "web old.reddit\(c.path) http=\(code) \(body.prefix(70).replacingOccurrences(of: "\n", with: " "))"
+                    Reddit.diag = "web old.reddit\(c.path): \(out.prefix(70).replacingOccurrences(of: "\n", with: " "))"
                     done(.failure(.offline("Reddit won't show this.\n\n" + Reddit.diag)))
                 }
             }
         }
     }
+
+    /// Runs in the logged-in web view: fetch old.reddit's HTML listing/search page and lift the posts
+    /// out of its DOM into the same {data:{children:[t3…]}} shape the .json used to return.
+    static let scrapeJS = """
+    try {
+      const r = await fetch(u, {credentials:'include', headers:{'Accept':'text/html'}});
+      const html = await r.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const num = s => { const n = parseInt((s||'').replace(/[^0-9]/g,'')); return isNaN(n) ? 0 : n; };
+      let children = [];
+      const things = [].slice.call(doc.querySelectorAll('#siteTable .thing.link'));
+      for (const t of things) {
+        const d = t.dataset;
+        if (!d.fullname || d.fullname.indexOf('t3_') !== 0) continue;
+        const a = t.querySelector('a.title');
+        const img = t.querySelector('.thumbnail img');
+        let thumb = img ? img.getAttribute('src') : '';
+        if (thumb && thumb.indexOf('//') === 0) thumb = 'https:' + thumb;
+        if (thumb && thumb.indexOf('http') !== 0) thumb = '';
+        children.push({kind:'t3', data:{
+          id: d.fullname.slice(3), name: d.fullname,
+          title: a ? a.textContent.trim() : '',
+          url: d.url || (a ? a.getAttribute('href') : '') || '',
+          permalink: d.permalink || '',
+          author: d.author || '',
+          subreddit: d.subreddit || '',
+          domain: d.domain || '',
+          score: num(d.score),
+          num_comments: num(d.commentsCount),
+          created_utc: (parseInt(d.timestamp) || 0) / 1000,
+          over_18: d.nsfw === 'true',
+          is_self: (d.domain || '').indexOf('self.') === 0,
+          stickied: t.classList.contains('stickied'),
+          thumbnail: thumb || ''
+        }});
+      }
+      if (children.length === 0) {
+        const srs = [].slice.call(doc.querySelectorAll('.search-result-link'));
+        for (const el of srs) {
+          const a = el.querySelector('a.search-title') || el.querySelector('header a') || el.querySelector('a.search-link');
+          const meta = (el.querySelector('.search-result-meta') || {textContent:''}).textContent || '';
+          const sub = el.querySelector('.search-subreddit-link');
+          const au = el.querySelector('.author');
+          const com = el.querySelector('.search-comments');
+          let perma = com ? com.getAttribute('href') : (a ? a.getAttribute('href') : '');
+          if (perma && perma.indexOf('http') === 0) { try { perma = new URL(perma).pathname; } catch(e) {} }
+          const toks = meta.split(' ');
+          let score = 0, ncom = 0;
+          for (let i = 0; i < toks.length; i++) {
+            if (toks[i].indexOf('point') === 0 && i > 0) score = num(toks[i-1]);
+            if (toks[i].indexOf('comment') === 0 && i > 0) ncom = num(toks[i-1]);
+          }
+          children.push({kind:'t3', data:{
+            id:'', name:'',
+            title: a ? a.textContent.trim() : '',
+            url: (a ? a.getAttribute('href') : '') || '',
+            permalink: perma || '',
+            author: au ? au.textContent.trim() : '',
+            subreddit: sub ? sub.textContent.replace('/r/','').replace('r/','') : '',
+            domain:'', score: score, num_comments: ncom, created_utc: 0,
+            over_18:false, is_self:false, stickied:false, thumbnail:''
+          }});
+        }
+      }
+      let after = null;
+      const nb = doc.querySelector('.next-button a');
+      if (nb) { try { after = new URL(nb.href).searchParams.get('after'); } catch(e) {} }
+      const blocked = html.indexOf('blocked by network security') >= 0 || html.indexOf('whoa there') >= 0;
+      return JSON.stringify({kind:'Listing', data:{children: children, after: after}, _diag:{len: html.length, things: things.length, blocked: blocked}});
+    } catch(e) { return 'ERR:' + e; }
+    """
 }
 
 // MARK: - pictures
