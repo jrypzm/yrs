@@ -168,7 +168,7 @@ final class PostVC: UIViewController, UITextViewDelegate {
 
     @objc private func load() {
         guard !post.permalink.isEmpty else { return }
-        Reddit.shared.get(post.permalink, ["limit": "200", "depth": "12"]) { [weak self] r in
+        Reddit.shared.get(post.permalink, ["limit": "100", "depth": "8"]) { [weak self] r in
             guard let s = self else { return }
             s.tv.refreshControl?.endRefreshing()
             switch r {

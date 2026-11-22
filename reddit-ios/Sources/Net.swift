@@ -146,7 +146,11 @@ final class Reddit {
     }
 
     /// Gets the guest token ready at launch, so the first feed doesn't wait for it.
-    func prepare() { token(refresh: false) { _ in } }
+    func prepare() {
+        token(refresh: false) { _ in }
+        // warm the hidden web view in the background so New/search are ready the first time you tap them
+        if isSignedIn { WebReddit.shared.warmup() }
+    }
 
     private func call(_ path: String, _ q: [String: String], token: String, refresh: Bool, done: @escaping (Result<Any, APIError>) -> Void) {
         var req = URLRequest(url: url(path, q))
@@ -398,6 +402,12 @@ final class WebReddit: NSObject, WKNavigationDelegate {
             .first { $0.isKeyWindow } ?? UIApplication.shared.windows.first
     }
 
+    /// Start loading the web view ahead of time (called at launch), so the first New/search is instant.
+    func warmup() {
+        // a beat after launch so the key window exists, then load in the background
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.ensure() }
+    }
+
     private func ensure() {
         guard web == nil else { return }
         let c = WKWebViewConfiguration()
@@ -412,13 +422,13 @@ final class WebReddit: NSObject, WKNavigationDelegate {
         web = w
         w.load(URLRequest(url: URL(string: "https://old.reddit.com/")!))
         // reddit runs a JS bot-check as it loads; wait for the page to FINISH (so that check has
-        // passed and dropped its cookie) before we fetch. A long stop, in case load never fully settles.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in self?.markReady() }
+        // passed and dropped its cookie) before we fetch. A stop in case load never fully settles.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.markReady() }
     }
 
     func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) {
-        // give the bot-check script a beat to run after the HTML lands, then start serving
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.markReady() }
+        // the page finished (bot-check cleared) — start serving almost immediately
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.markReady() }
     }
 
     private func markReady() {
@@ -529,6 +539,11 @@ final class WebReddit: NSObject, WKNavigationDelegate {
             if (toks[i].indexOf('point') === 0 && i > 0) score = num(toks[i-1]);
             if (toks[i].indexOf('comment') === 0 && i > 0) ncom = num(toks[i-1]);
           }
+          const simg = el.querySelector('.thumbnail img') || el.querySelector('img');
+          let sthumb = simg ? simg.getAttribute('src') : '';
+          if (sthumb && sthumb.indexOf('//') === 0) sthumb = 'https:' + sthumb;
+          if (sthumb && sthumb.indexOf('http') !== 0) sthumb = '';
+          const sdomain = el.querySelector('.search-result-meta a.domain') || el.querySelector('span.domain');
           children.push({kind:'t3', data:{
             id:'', name:'',
             title: a ? a.textContent.trim() : '',
@@ -536,8 +551,9 @@ final class WebReddit: NSObject, WKNavigationDelegate {
             permalink: perma || '',
             author: au ? au.textContent.trim() : '',
             subreddit: sub ? sub.textContent.replace('/r/','').replace('r/','') : '',
-            domain:'', score: score, num_comments: ncom, created_utc: 0,
-            over_18:false, is_self:false, stickied:false, thumbnail:''
+            domain: sdomain ? sdomain.textContent.trim() : '',
+            score: score, num_comments: ncom, created_utc: 0,
+            over_18:false, is_self:false, stickied:false, thumbnail: sthumb || ''
           }});
         }
       }
