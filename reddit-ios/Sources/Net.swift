@@ -134,7 +134,7 @@ final class Reddit {
         while p.hasPrefix("/") { p.removeFirst() }
         while p.count > 1, p.hasSuffix("/") { p.removeLast() }
         if p.hasSuffix(".json") { p.removeLast(5) }
-        return p == "new" || p.hasSuffix("/new") || p == "search" || p.hasSuffix("/search")
+        return p == "new" || p.hasSuffix("/new") || p == "search" || p.hasSuffix("/search") || p.hasPrefix("user/")
     }
 
     private func oauthGet(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
@@ -357,6 +357,18 @@ final class Reddit {
         guard isSignedIn else { DispatchQueue.main.async { done(false) }; return }
         WebReddit.shared.subscribe(name, join: join, done: done)
     }
+
+    /// Reply to a post or comment (its fullname). `done` gets an error message, or nil on success.
+    func reply(to fullname: String, text: String, done: @escaping (String?) -> Void) {
+        guard isSignedIn else { DispatchQueue.main.async { done("Sign in first.") }; return }
+        WebReddit.shared.reply(to: fullname, text: text, done: done)
+    }
+
+    /// Submit a text post to r/<sr>. `done` gets the new post's URL, or nil on failure.
+    func submit(sr: String, title: String, text: String, done: @escaping (String?) -> Void) {
+        guard isSignedIn else { DispatchQueue.main.async { done(nil) }; return }
+        WebReddit.shared.submit(sr: sr, title: title, text: text, done: done)
+    }
 }
 
 // MARK: - reading through your browser session
@@ -466,6 +478,59 @@ final class WebReddit: NSObject, WKNavigationDelegate {
                     var ok = false
                     if case .success(let v) = res, let s = v as? String, s.hasPrefix("HTTP2") { ok = true }
                     done(ok)
+                }
+            }
+        }
+    }
+
+    /// Post a reply to a comment or post (its fullname, t1_/t3_), from inside the page. `done` gets an
+    /// error message, or nil on success.
+    func reply(to fullname: String, text: String, done: @escaping (String?) -> Void) {
+        whenReady {
+            guard let web = self.web else { done("Not ready — pull down and try again."); return }
+            let js = """
+            try {
+              const me = await (await fetch('https://old.reddit.com/api/me.json', {credentials:'include'})).json();
+              const uh = (me && me.data && me.data.modhash) || '';
+              if (!uh) return 'ERR|not signed in';
+              const body = 'thing_id=' + encodeURIComponent(THING) + '&text=' + encodeURIComponent(TEXT) + '&uh=' + encodeURIComponent(uh) + '&api_type=json';
+              const r = await fetch('https://old.reddit.com/api/comment', {method:'POST', credentials:'include', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body});
+              const j = await r.json();
+              if (j && j.json && j.json.errors && j.json.errors.length) return 'ERR|' + (j.json.errors[0][1] || j.json.errors[0][0] || 'rejected');
+              if (r.status < 200 || r.status >= 300) return 'ERR|Reddit said ' + r.status;
+              return 'OK';
+            } catch(e) { return 'ERR|' + e; }
+            """
+            web.callAsyncJavaScript(js, arguments: ["THING": fullname, "TEXT": text], in: nil, in: .page) { res in
+                DispatchQueue.main.async {
+                    guard case .success(let v) = res, let s = v as? String else { done("Couldn't reach Reddit."); return }
+                    if s == "OK" { done(nil) } else { done(String(s.dropFirst(4))) }   // drop "ERR|"
+                }
+            }
+        }
+    }
+
+    /// Submit a self (text) post to r/<sr>. `done` gets the new post's URL, or nil on failure.
+    func submit(sr: String, title: String, text: String, done: @escaping (String?) -> Void) {
+        whenReady {
+            guard let web = self.web else { done(nil); return }
+            let js = """
+            try {
+              const me = await (await fetch('https://old.reddit.com/api/me.json', {credentials:'include'})).json();
+              const uh = (me && me.data && me.data.modhash) || '';
+              if (!uh) return 'ERR|not signed in';
+              const body = 'sr=' + encodeURIComponent(SR) + '&kind=self&title=' + encodeURIComponent(TITLE) + '&text=' + encodeURIComponent(TEXT) + '&uh=' + encodeURIComponent(uh) + '&api_type=json&resubmit=true&sendreplies=true';
+              const r = await fetch('https://old.reddit.com/api/submit', {method:'POST', credentials:'include', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body});
+              const j = await r.json();
+              if (j && j.json && j.json.errors && j.json.errors.length) return 'ERR|' + (j.json.errors[0][1] || j.json.errors[0][0] || 'rejected');
+              const url = (j && j.json && j.json.data && (j.json.data.url || '')) || '';
+              return 'OK|' + url;
+            } catch(e) { return 'ERR|' + e; }
+            """
+            web.callAsyncJavaScript(js, arguments: ["SR": sr, "TITLE": title, "TEXT": text], in: nil, in: .page) { res in
+                DispatchQueue.main.async {
+                    guard case .success(let v) = res, let s = v as? String, s.hasPrefix("OK|") else { done(nil); return }
+                    done(String(s.dropFirst(3)))   // the new post URL (may be empty)
                 }
             }
         }

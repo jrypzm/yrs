@@ -157,7 +157,9 @@ enum Lists {
     }
 
     static func user(_ name: String) -> Feed {
-        feed("u/" + name, choices: ["New", "Top"]) { c in ("/user/\(name)/submitted", ["sort": c == 0 ? "new" : "top"]) }
+        let f = feed("u/" + name, choices: ["New", "Top"]) { c in ("/user/\(name)/submitted", ["sort": c == 0 ? "new" : "top"]) }
+        if Reddit.shared.isSignedIn { f.navigationItem.rightBarButtonItem = JoinButton(follow: name) }
+        return f
     }
 
     static func search(_ q: String) -> Feed {
@@ -199,20 +201,31 @@ final class StarButton: UIBarButtonItem {
     }
 }
 
-/// "Join" / "Joined ✓" — follows or unfollows the subreddit on your real Reddit account.
+/// "Join"/"Joined ✓" for a subreddit, or "Follow"/"Following ✓" for a person — toggles the
+/// subscription on your real account (following a person is just subscribing to their u_ profile).
 final class JoinButton: UIBarButtonItem {
-    private var name = ""
+    private var sr = ""           // the subreddit to (un)subscribe: a name, or "u_<user>" for a follow
+    private var onWord = "Join"
+    private var offWord = "Joined ✓"
     private var joined: Bool?
     private var busy = false
 
-    convenience init(_ name: String) {
+    /// Join/leave a subreddit.
+    convenience init(_ name: String) { self.init(sr: name, on: "Join", off: "Joined ✓") }
+
+    /// Follow/unfollow a person.
+    convenience init(follow user: String) { self.init(sr: "u_" + user, on: "Follow", off: "Following ✓") }
+
+    private convenience init(sr: String, on: String, off: String) {
         self.init()
-        self.name = name
+        self.sr = sr
+        self.onWord = on
+        self.offWord = off
         style = .plain
         target = self
         action = #selector(tap)
-        title = "Join"
-        Reddit.shared.subStatus(name) { [weak self] s in
+        title = on
+        Reddit.shared.subStatus(sr) { [weak self] s in
             self?.joined = s
             self?.show()
         }
@@ -220,15 +233,15 @@ final class JoinButton: UIBarButtonItem {
 
     private func show() {
         guard !busy else { return }
-        title = (joined == true) ? "Joined ✓" : "Join"
+        title = (joined == true) ? offWord : onWord
     }
 
     @objc private func tap() {
         guard !busy else { return }
         let want = !(joined == true)
         busy = true
-        title = want ? "Joining…" : "Leaving…"
-        Reddit.shared.subscribe(name, join: want) { [weak self] ok in
+        title = "…"
+        Reddit.shared.subscribe(sr, join: want) { [weak self] ok in
             guard let s = self else { return }
             s.busy = false
             if ok { s.joined = want }   // on failure, keep the prior state and label

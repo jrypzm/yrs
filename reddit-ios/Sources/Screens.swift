@@ -63,6 +63,9 @@ final class HomeVC: Feed, UISearchBarDelegate {
         }
         rows.append(Item(title: "Open a Reddit link", detail: "Paste a link to a post, subreddit or person.", action: { [weak self] in self?.openLink() }))
         if Reddit.shared.isSignedIn {
+            rows.append(Item(title: "New post", detail: "Write a text post to a subreddit", action: { [weak self] in
+                self?.present(UINavigationController(rootViewController: SubmitVC()), animated: true)
+            }))
             rows.append(Item(title: "Your front page", detail: "From the subreddits you follow", open: { Lists.front() }))
             rows.append(Item(title: "Subreddits you follow", open: { Lists.feed("Following") { _ in ("/subreddits/mine/subscriber", [:]) } }))
             rows.append(Item(title: "Sign out", action: { [weak self] in
@@ -272,6 +275,9 @@ final class PostVC: UIViewController, UITextViewDelegate {
             d.text(f, Style.body, Style.dim)
         } else if let cs = comments {
             d.gap(12)
+            if Reddit.shared.isSignedIn, !post.id.isEmpty, let u = URL(string: "yrsreply:t3_\(post.id)") {
+                d.add(NSAttributedString(string: "＋ Add a comment", attributes: [.font: Style.bold(14), .foregroundColor: Style.link, .link: u]), Style.para(after: 10))
+            }
             d.text(cs.isEmpty ? "No comments yet." : "\(count(post.j.i("num_comments"))) comments", Style.bold(15), Style.dim, Style.para(after: 10))
             CommentDoc.render(cs, linkID: post.id.isEmpty ? "" : "t3_" + post.id, into: d)
         } else {
@@ -293,8 +299,26 @@ final class PostVC: UIViewController, UITextViewDelegate {
     @objc private func inSafari() { Safari.open(post.permalink, from: self) }
 
     func textView(_ textView: UITextView, shouldInteractWith url: URL, in range: NSRange, interaction: UITextItemInteraction) -> Bool {
-        if interaction == .invokeDefaultAction { Router.open(url, from: self) }
+        if interaction == .invokeDefaultAction {
+            if url.scheme == "yrsreply" {
+                compose(replyTo: String(url.absoluteString.dropFirst("yrsreply:".count)))
+            } else {
+                Router.open(url, from: self)
+            }
+        }
         return false
+    }
+
+    /// Opens the reply composer for a post or comment (its fullname); reloads to show the reply.
+    private func compose(replyTo fullname: String) {
+        guard Reddit.shared.isSignedIn else { return }
+        let c = ComposeVC(title: "Reply", hint: "Your reply…") { [weak self] text, done in
+            Reddit.shared.reply(to: fullname, text: text) { err in
+                done(err)
+                if err == nil { self?.load() }
+            }
+        }
+        present(UINavigationController(rootViewController: c), animated: true)
     }
 
     override func didReceiveMemoryWarning() {
@@ -615,7 +639,12 @@ enum CommentDoc {
         guard kind == "t1" else { return }
         d.indent = indent(depth, baseDepth)
         let shade = UIColor(white: max(0.32, 0.55 - CGFloat(max(depth - baseDepth, 0)) * 0.04), alpha: 1)
-        d.text(joined(["u/" + j.s("author"), count(j.i("score")) + " points", ago(j.d("created_utc"))]) + (j.b("is_submitter") ? " · OP" : ""), Style.bold(13), shade, Style.para(after: 3))
+        let headStr = joined(["u/" + j.s("author"), count(j.i("score")) + " points", ago(j.d("created_utc"))]) + (j.b("is_submitter") ? " · OP" : "")
+        let head = NSMutableAttributedString(string: headStr, attributes: [.font: Style.bold(13), .foregroundColor: shade])
+        if Reddit.shared.isSignedIn, !j.s("id").isEmpty, let u = URL(string: "yrsreply:t1_\(j.s("id"))") {
+            head.append(NSAttributedString(string: "   reply", attributes: [.font: Style.bold(13), .foregroundColor: Style.link, .link: u]))
+        }
+        d.add(head, Style.para(after: 3))
         Markdown.render(j.s("body"), into: d)
         d.gap(4)
         for r in j.o("replies").o("data").a("children") { one(r, linkID: linkID, baseDepth: baseDepth, into: d) }
@@ -685,5 +714,171 @@ final class MoreVC: UIViewController, UITextViewDelegate {
     func textView(_ textView: UITextView, shouldInteractWith url: URL, in range: NSRange, interaction: UITextItemInteraction) -> Bool {
         if interaction == .invokeDefaultAction { Router.open(url, from: self) }
         return false
+    }
+}
+
+// MARK: - writing (replies and new posts)
+
+/// A plain composer for a reply. Cancel / Send in the nav bar; the text is posted through the web view.
+final class ComposeVC: UIViewController, UITextViewDelegate {
+    private let navTitle: String
+    private let hint: String
+    private let onSend: (String, @escaping (String?) -> Void) -> Void
+    private let tv = UITextView()
+    private let placeholder = UILabel()
+
+    init(title: String, hint: String, onSend: @escaping (String, @escaping (String?) -> Void) -> Void) {
+        self.navTitle = title
+        self.hint = hint
+        self.onSend = onSend
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = navTitle
+        view.backgroundColor = .black
+        tv.backgroundColor = .black
+        tv.textColor = .white
+        tv.font = .systemFont(ofSize: 16)
+        tv.keyboardDismissMode = .interactive
+        tv.textContainerInset = UIEdgeInsets(top: 14, left: 12, bottom: 14, right: 12)
+        tv.delegate = self
+        view.addSubview(tv)
+        placeholder.text = hint
+        placeholder.textColor = Style.dim
+        placeholder.font = .systemFont(ofSize: 16)
+        view.addSubview(placeholder)
+        navigationItem.leftBarButtonItem = UIBarButtonItem(title: "Cancel", style: .plain, target: self, action: #selector(cancel))
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Send", style: .done, target: self, action: #selector(send))
+        NotificationCenter.default.addObserver(self, selector: #selector(kbd(_:)), name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+        tv.becomeFirstResponder()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        tv.frame = view.bounds
+        placeholder.frame = CGRect(x: 17, y: 18, width: view.bounds.width - 34, height: 22)
+    }
+
+    func textViewDidChange(_ textView: UITextView) { placeholder.isHidden = !textView.text.isEmpty }
+
+    @objc private func kbd(_ n: Notification) {
+        guard let f = (n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else { return }
+        let overlap = max(0, view.bounds.maxY - view.convert(f, from: nil).minY)
+        tv.contentInset.bottom = overlap
+        tv.verticalScrollIndicatorInsets.bottom = overlap
+    }
+
+    @objc private func cancel() { dismiss(animated: true) }
+
+    @objc private func send() {
+        let text = (tv.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        navigationItem.rightBarButtonItem?.isEnabled = false
+        navigationItem.rightBarButtonItem?.title = "Sending…"
+        onSend(text) { [weak self] err in
+            guard let s = self else { return }
+            if let err = err, !err.isEmpty {
+                s.navigationItem.rightBarButtonItem?.isEnabled = true
+                s.navigationItem.rightBarButtonItem?.title = "Send"
+                let a = UIAlertController(title: "Couldn't post", message: err, preferredStyle: .alert)
+                a.addAction(UIAlertAction(title: "OK", style: .default))
+                s.present(a, animated: true)
+            } else {
+                s.dismiss(animated: true)
+            }
+        }
+    }
+}
+
+/// A plain composer for a new text post: subreddit, title, body.
+final class SubmitVC: UIViewController, UITextViewDelegate {
+    private let subField = UITextField()
+    private let titleField = UITextField()
+    private let bodyView = UITextView()
+    private let bodyHint = UILabel()
+    private let prefill: String
+
+    init(sr: String = "") {
+        prefill = sr
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "New post"
+        view.backgroundColor = .black
+        for f in [subField, titleField] {
+            f.textColor = .white
+            f.font = .systemFont(ofSize: 16)
+            f.autocorrectionType = .no
+            f.backgroundColor = UIColor(white: 0.1, alpha: 1)
+            f.borderStyle = .roundedRect
+            view.addSubview(f)
+        }
+        subField.placeholder = "subreddit (e.g. test)"
+        subField.autocapitalizationType = .none
+        subField.text = prefill
+        titleField.placeholder = "Title"
+        bodyView.backgroundColor = UIColor(white: 0.1, alpha: 1)
+        bodyView.textColor = .white
+        bodyView.font = .systemFont(ofSize: 16)
+        bodyView.layer.cornerRadius = 6
+        bodyView.textContainerInset = UIEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
+        bodyView.delegate = self
+        view.addSubview(bodyView)
+        bodyHint.text = "Text (optional)"
+        bodyHint.textColor = Style.dim
+        bodyHint.font = .systemFont(ofSize: 16)
+        bodyView.addSubview(bodyHint)
+        navigationItem.leftBarButtonItem = UIBarButtonItem(title: "Cancel", style: .plain, target: self, action: #selector(cancel))
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Post", style: .done, target: self, action: #selector(submit))
+        (prefill.isEmpty ? subField : titleField).becomeFirstResponder()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let w = view.bounds.width - 24
+        let top = view.safeAreaInsets.top + 12
+        subField.frame = CGRect(x: 12, y: top, width: w, height: 40)
+        titleField.frame = CGRect(x: 12, y: top + 48, width: w, height: 40)
+        bodyView.frame = CGRect(x: 12, y: top + 96, width: w, height: 180)
+        bodyHint.frame = CGRect(x: 12, y: 10, width: w - 20, height: 22)
+    }
+
+    func textViewDidChange(_ textView: UITextView) { bodyHint.isHidden = !textView.text.isEmpty }
+
+    @objc private func cancel() { dismiss(animated: true) }
+
+    @objc private func submit() {
+        var sr = (subField.text ?? "").trimmingCharacters(in: .whitespaces)
+        if sr.lowercased().hasPrefix("r/") { sr = String(sr.dropFirst(2)) }
+        let ttl = (titleField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = bodyView.text ?? ""
+        guard !sr.isEmpty, !ttl.isEmpty else {
+            let a = UIAlertController(title: "Need a subreddit and a title", message: nil, preferredStyle: .alert)
+            a.addAction(UIAlertAction(title: "OK", style: .default))
+            present(a, animated: true)
+            return
+        }
+        navigationItem.rightBarButtonItem?.isEnabled = false
+        navigationItem.rightBarButtonItem?.title = "Posting…"
+        Reddit.shared.submit(sr: sr, title: ttl, text: body) { [weak self] url in
+            guard let s = self else { return }
+            if url != nil {
+                s.dismiss(animated: true)
+            } else {
+                s.navigationItem.rightBarButtonItem?.isEnabled = true
+                s.navigationItem.rightBarButtonItem?.title = "Post"
+                let a = UIAlertController(title: "Couldn't post", message: "Reddit wouldn't accept it — the subreddit may require you to be a member, may not allow text posts, or the title may break its rules.", preferredStyle: .alert)
+                a.addAction(UIAlertAction(title: "OK", style: .default))
+                s.present(a, animated: true)
+            }
+        }
     }
 }
