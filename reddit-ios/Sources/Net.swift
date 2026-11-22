@@ -91,11 +91,32 @@ final class Reddit {
     // MARK: reading
 
     func get(_ path: String, _ q: [String: String] = [:], done: @escaping (Result<Any, APIError>) -> Void) {
+        // New and comments: oauth always refuses these, so go straight to old.reddit (no wasted call)
+        if isSignedIn, Reddit.needsOldReddit(path) {
+            viaOldReddit(path, q) { r in
+                if case .success = r { done(r) }
+                else { self.oauthGet(path, q, done: done) }   // if the cookie route fails, still try oauth
+            }
+            return
+        }
+        oauthGet(path, q, done: done)
+    }
+
+    private func oauthGet(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
         token(refresh: false) { [weak self] t in
             guard let s = self else { return }
             guard let t = t else { done(.failure(.offline("Couldn't reach Reddit. Pull down to try again.\n\n" + Reddit.diag))); return }
             s.call(path, q, token: t, refresh: true, done: done)
         }
+    }
+
+    /// The two endpoints oauth refuses — a /new listing, or a comment page.
+    static func needsOldReddit(_ path: String) -> Bool {
+        var p = path
+        while p.hasPrefix("/") { p.removeFirst() }
+        while p.count > 1, p.hasSuffix("/") { p.removeLast() }
+        if p.hasSuffix(".json") { p.removeLast(5) }
+        return p == "new" || p.hasSuffix("/new") || p.contains("/comments/")
     }
 
     /// Gets the guest token ready at launch, so the first feed doesn't wait for it.
