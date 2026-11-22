@@ -108,13 +108,17 @@ final class Reddit {
         }
     }
 
-    /// The two endpoints oauth refuses — a /new listing, or a comment page.
+    /// Everything oauth refuses for a logged-out-style app id — /new, comment pages, search, and
+    /// "load more comments" — read the way your browser does: old.reddit's .json with your cookies.
     static func needsOldReddit(_ path: String) -> Bool {
         var p = path
         while p.hasPrefix("/") { p.removeFirst() }
         while p.count > 1, p.hasSuffix("/") { p.removeLast() }
         if p.hasSuffix(".json") { p.removeLast(5) }
-        return p == "new" || p.hasSuffix("/new") || p.contains("/comments/")
+        return p == "new" || p.hasSuffix("/new")
+            || p.contains("/comments/") || p.hasPrefix("comments/")
+            || p == "search" || p.hasSuffix("/search")
+            || p == "api/morechildren"
     }
 
     /// Gets the guest token ready at launch, so the first feed doesn't wait for it.
@@ -287,6 +291,45 @@ final class Reddit {
         cached = nil
         WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
             self?.signedIn(false)
+        }
+    }
+
+    // MARK: joining subreddits (needs you signed in)
+
+    /// Whether you already follow r/<name> (nil if unknown or not signed in), so the button reads right.
+    func subStatus(_ name: String, done: @escaping (Bool?) -> Void) {
+        guard isSignedIn else { done(nil); return }
+        get("/r/\(name)/about") { r in
+            if case .success(let j) = r { done((j as? JSON)?.o("data").b("user_is_subscriber")) }
+            else { done(nil) }
+        }
+    }
+
+    /// Follow or unfollow r/<name>, the way the site does it: your login cookies plus the page's modhash.
+    func subscribe(_ name: String, join: Bool, done: @escaping (Bool) -> Void) {
+        guard isSignedIn else { DispatchQueue.main.async { done(false) }; return }
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            let header = cookies.filter { $0.domain.hasSuffix("reddit.com") }.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+            guard !header.isEmpty else { DispatchQueue.main.async { done(false) }; return }
+            var me = URLRequest(url: URL(string: "https://old.reddit.com/api/me.json?raw_json=1")!)
+            me.setValue(safariUA, forHTTPHeaderField: "User-Agent")
+            me.setValue(header, forHTTPHeaderField: "Cookie")
+            me.setValue("application/json", forHTTPHeaderField: "Accept")
+            self.session.dataTask(with: me) { data, _, _ in
+                let modhash = (data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? JSON)?.o("data").s("modhash") ?? ""
+                guard !modhash.isEmpty else { DispatchQueue.main.async { done(false) }; return }
+                var req = URLRequest(url: URL(string: "https://old.reddit.com/api/subscribe")!)
+                req.httpMethod = "POST"
+                req.setValue(safariUA, forHTTPHeaderField: "User-Agent")
+                req.setValue(header, forHTTPHeaderField: "Cookie")
+                req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+                let sr = name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? name
+                req.httpBody = Data("action=\(join ? "sub" : "unsub")&sr_name=\(sr)&uh=\(modhash)&api_type=json&skip_initial_defaults=true".utf8)
+                self.session.dataTask(with: req) { _, resp, _ in
+                    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                    DispatchQueue.main.async { done((200 ..< 300).contains(code)) }
+                }.resume()
+            }.resume()
         }
     }
 }

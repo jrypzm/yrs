@@ -141,7 +141,7 @@ enum Lists {
     static func sub(_ name: String) -> Feed {
         let f = feed("r/" + name, choices: sorts) { sortPath("/r/" + name, $0) }
         f.navigationItem.title = "r/" + name
-        f.navigationItem.rightBarButtonItem = StarButton(name)
+        f.navigationItem.rightBarButtonItems = Reddit.shared.isSignedIn ? [StarButton(name), JoinButton(name)] : [StarButton(name)]
         return f
     }
 
@@ -196,5 +196,43 @@ final class StarButton: UIBarButtonItem {
     @objc private func tap() {
         Favorites.toggle(name)
         show()
+    }
+}
+
+/// "Join" / "Joined ✓" — follows or unfollows the subreddit on your real Reddit account.
+final class JoinButton: UIBarButtonItem {
+    private var name = ""
+    private var joined: Bool?
+    private var busy = false
+
+    convenience init(_ name: String) {
+        self.init()
+        self.name = name
+        style = .plain
+        target = self
+        action = #selector(tap)
+        title = "Join"
+        Reddit.shared.subStatus(name) { [weak self] s in
+            self?.joined = s
+            self?.show()
+        }
+    }
+
+    private func show() {
+        guard !busy else { return }
+        title = (joined == true) ? "Joined ✓" : "Join"
+    }
+
+    @objc private func tap() {
+        guard !busy else { return }
+        let want = !(joined == true)
+        busy = true
+        title = want ? "Joining…" : "Leaving…"
+        Reddit.shared.subscribe(name, join: want) { [weak self] ok in
+            guard let s = self else { return }
+            s.busy = false
+            if ok { s.joined = want }   // on failure, keep the prior state and label
+            s.show()
+        }
     }
 }

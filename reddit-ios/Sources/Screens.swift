@@ -168,7 +168,7 @@ final class PostVC: UIViewController, UITextViewDelegate {
 
     @objc private func load() {
         guard !post.permalink.isEmpty else { return }
-        Reddit.shared.get(post.permalink, ["limit": "120", "depth": "6"]) { [weak self] r in
+        Reddit.shared.get(post.permalink, ["limit": "100", "depth": "5"]) { [weak self] r in
             guard let s = self else { return }
             s.tv.refreshControl?.endRefreshing()
             switch r {
@@ -252,25 +252,12 @@ final class PostVC: UIViewController, UITextViewDelegate {
         } else if let cs = comments {
             d.gap(12)
             d.text(cs.isEmpty ? "No comments yet." : "\(count(post.j.i("num_comments"))) comments", Style.bold(15), Style.dim, Style.para(after: 10))
-            for c in cs { comment(c, into: d) }
+            CommentDoc.render(cs, linkID: post.id.isEmpty ? "" : "t3_" + post.id, into: d)
         } else {
             d.gap(12)
             d.text("Loading comments…", Style.body, Style.dim)
         }
         tv.attributedText = d.result
-    }
-
-    private func comment(_ c: JSON, into d: Doc) {
-        guard c.s("kind") == "t1" else { return }
-        let j = c.o("data")
-        let depth = j.i("depth")
-        d.indent = CGFloat(min(depth, 6)) * 14
-        let shade = UIColor(white: max(0.32, 0.55 - CGFloat(depth) * 0.04), alpha: 1)
-        d.text(joined(["u/" + j.s("author"), count(j.i("score")) + " points", ago(j.d("created_utc"))]) + (j.b("is_submitter") ? " · OP" : ""), Style.bold(13), shade, Style.para(after: 3))
-        Markdown.render(j.s("body"), into: d)
-        d.gap(4)
-        for r in j.o("replies").o("data").a("children") { comment(r, into: d) }
-        d.indent = 0
     }
 
     @objc private func openMedia() {
@@ -437,7 +424,11 @@ enum Router {
         if host == "redd.it", parts.count == 1 { return PostVC(permalink: "/comments/" + parts[0]) }
         if host == "i.redd.it" || host == "preview.redd.it" { return nil }
         guard host.hasSuffix("reddit.com") else { return nil }
+        // a link that points at one comment (…/comments/ID/title/COMMENTID) keeps its full path,
+        // so tapping "continue this thread" opens that exact sub-conversation, not the post from the top
+        if parts.count >= 6, parts[0] == "r", parts[2] == "comments" { return PostVC(permalink: url.path) }
         if parts.count >= 4, parts[0] == "r", parts[2] == "comments" { return PostVC(permalink: "/r/\(parts[1])/comments/\(parts[3])") }
+        if parts.count >= 4, parts[0] == "comments" { return PostVC(permalink: url.path) }
         if parts.count >= 2, parts[0] == "comments" { return PostVC(permalink: "/comments/" + parts[1]) }
         if parts.count >= 2, parts[0] == "r", parts.count == 2 || ["hot", "new", "top", "rising"].contains(parts[2]) { return Lists.sub(parts[1]) }
         if parts.count >= 2, parts[0] == "u" || parts[0] == "user" { return Lists.user(parts[1]) }
@@ -445,6 +436,16 @@ enum Router {
     }
 
     static func open(_ url: URL, from vc: UIViewController) {
+        // "load more replies" link: yrsmore:t3_LINKID/child1,child2,… — fetch those comments in-app
+        if url.scheme == "yrsmore" {
+            let body = String(url.absoluteString.dropFirst("yrsmore:".count))
+            let bits = body.split(separator: "/", maxSplits: 1).map(String.init)
+            if bits.count == 2 {
+                let kids = bits[1].split(separator: ",").map(String.init)
+                vc.navigationController?.pushViewController(MoreVC(linkID: bits[0], children: kids), animated: true)
+            }
+            return
+        }
         var u = url
         if u.host == nil, let r = URL(string: "https://www.reddit.com" + (u.path.hasPrefix("/") ? u.path : "/" + u.path)) { u = r }
         let host = (u.host ?? "").lowercased()
@@ -552,5 +553,124 @@ enum Safari {
         s.preferredControlTintColor = .white
         s.dismissButtonStyle = .close
         vc.present(s, animated: true)
+    }
+}
+
+// MARK: - comments
+
+/// Lays comment threads into a Doc. Shared by the post screen and the "load more" screen, so a
+/// reply reads the same wherever it appears. A collapsed branch becomes a tappable link that
+/// loads the rest in the app — never the browser.
+enum CommentDoc {
+    /// `linkID` is the post's fullname (t3_…), used to fetch collapsed replies. `baseDepth` pulls a
+    /// sub-conversation back to the left margin so a drilled-in thread doesn't start half-way across.
+    static func render(_ children: [JSON], linkID: String, baseDepth: Int = 0, into d: Doc) {
+        for c in children { one(c, linkID: linkID, baseDepth: baseDepth, into: d) }
+    }
+
+    private static func indent(_ depth: Int, _ base: Int) -> CGFloat { CGFloat(min(max(depth - base, 0), 6)) * 14 }
+
+    private static func one(_ c: JSON, linkID: String, baseDepth: Int, into d: Doc) {
+        let kind = c.s("kind")
+        let j = c.o("data")
+        let depth = j.i("depth")
+        if kind == "more" {
+            d.indent = indent(depth, baseDepth)
+            let kids = (j["children"] as? [String]) ?? []
+            let n = j.i("count")
+            let label: String
+            let dest: URL?
+            if kids.isEmpty {
+                // depth-limited "continue this thread": open that comment's own page (its full replies)
+                let parent = j.s("parent_id")
+                let cid = parent.hasPrefix("t1_") ? String(parent.dropFirst(3)) : ""
+                let post = linkID.hasPrefix("t3_") ? String(linkID.dropFirst(3)) : ""
+                label = "→ continue this thread"
+                dest = (cid.isEmpty || post.isEmpty) ? nil : URL(string: "https://old.reddit.com/comments/\(post)/_/\(cid)")
+            } else {
+                let shown = n > 0 ? count(n) : "\(kids.count)"
+                label = "→ \(shown) more " + (n == 1 ? "reply" : "replies")
+                dest = URL(string: "yrsmore:\(linkID)/\(kids.prefix(100).joined(separator: ","))")
+            }
+            if let u = dest {
+                d.add(NSAttributedString(string: label, attributes: [.font: Style.body, .foregroundColor: Style.link, .link: u]))
+                d.gap(6)
+            }
+            d.indent = 0
+            return
+        }
+        guard kind == "t1" else { return }
+        d.indent = indent(depth, baseDepth)
+        let shade = UIColor(white: max(0.32, 0.55 - CGFloat(max(depth - baseDepth, 0)) * 0.04), alpha: 1)
+        d.text(joined(["u/" + j.s("author"), count(j.i("score")) + " points", ago(j.d("created_utc"))]) + (j.b("is_submitter") ? " · OP" : ""), Style.bold(13), shade, Style.para(after: 3))
+        Markdown.render(j.s("body"), into: d)
+        d.gap(4)
+        for r in j.o("replies").o("data").a("children") { one(r, linkID: linkID, baseDepth: baseDepth, into: d) }
+        d.indent = 0
+    }
+}
+
+/// The screen a "load more replies" link opens: fetches just those comments (old.reddit's
+/// morechildren, your cookies) and lays them out like any other thread, in the app.
+final class MoreVC: UIViewController, UITextViewDelegate {
+    private let linkID: String
+    private let children: [String]
+    private let tv = UITextView()
+    private var things: [JSON] = []
+    private var note: String?
+
+    init(linkID: String, children: [String]) {
+        self.linkID = linkID
+        self.children = children
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "More comments"
+        view.backgroundColor = .black
+        tv.frame = view.bounds
+        tv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        tv.backgroundColor = .black
+        tv.isEditable = false
+        tv.alwaysBounceVertical = true
+        tv.textContainerInset = UIEdgeInsets(top: 14, left: 10, bottom: 30, right: 10)
+        tv.delegate = self
+        view.addSubview(tv)
+        tv.attributedText = NSAttributedString(string: "Loading…", attributes: [.font: Style.body, .foregroundColor: Style.dim])
+        load()
+    }
+
+    private func load() {
+        let q = ["api_type": "json", "link_id": linkID, "children": children.prefix(100).joined(separator: ","), "limit_children": "false"]
+        Reddit.shared.get("/api/morechildren", q) { [weak self] r in
+            guard let s = self else { return }
+            switch r {
+            case .success(let j):
+                s.things = (j as? JSON)?.o("json").o("data").a("things") ?? []
+                s.note = s.things.isEmpty ? "Nothing more to load here." : nil
+            case .failure(let e):
+                s.note = e.description
+            }
+            s.render()
+        }
+    }
+
+    private func render() {
+        let d = Doc()
+        if let note = note {
+            d.text(note, Style.body, Style.dim)
+        } else {
+            let base = things.map { $0.o("data").i("depth") }.min() ?? 0
+            CommentDoc.render(things, linkID: linkID, baseDepth: base, into: d)
+        }
+        tv.attributedText = d.result
+    }
+
+    func textView(_ textView: UITextView, shouldInteractWith url: URL, in range: NSRange, interaction: UITextItemInteraction) -> Bool {
+        if interaction == .invokeDefaultAction { Router.open(url, from: self) }
+        return false
     }
 }
