@@ -97,8 +97,16 @@ final class Reddit {
             viaOldReddit(path, q, done: done)
             return
         }
-        // Everything else (feeds, /new, /search, the comment API) asks oauth first with your account
-        // token; call() falls back to old.reddit only if oauth refuses.
+        // New, search and "load more comments": neither oauth nor old.reddit will serve these to the
+        // app, but your logged-in browser sees them fine — so fetch reddit.com's own .json through a
+        // real web view carrying your session. If that ever fails, fall back to the old oauth path.
+        if isSignedIn, Reddit.needsWeb(path) {
+            WebReddit.shared.get(path, q) { [weak self] r in
+                if case .success = r { done(r) } else { self?.oauthGet(path, q, done: done) }
+            }
+            return
+        }
+        // Everything else (feeds) asks oauth with your token; call() falls back to old.reddit if refused.
         oauthGet(path, q, done: done)
     }
 
@@ -108,6 +116,16 @@ final class Reddit {
         while p.hasPrefix("/") { p.removeFirst() }
         if p.hasSuffix(".json") { p.removeLast(5) }
         return p.contains("/comments/") || p.hasPrefix("comments/")
+    }
+
+    /// New, search, and the "load more comments" API — blocked on both oauth and old.reddit, so these
+    /// go through the logged-in web view (your real browser session) instead.
+    static func needsWeb(_ path: String) -> Bool {
+        var p = path
+        while p.hasPrefix("/") { p.removeFirst() }
+        while p.count > 1, p.hasSuffix("/") { p.removeLast() }
+        if p.hasSuffix(".json") { p.removeLast(5) }
+        return p == "new" || p.hasSuffix("/new") || p == "search" || p.hasSuffix("/search") || p == "api/morechildren"
     }
 
     private func oauthGet(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
@@ -348,6 +366,93 @@ final class Reddit {
                     DispatchQueue.main.async { done((200 ..< 300).contains(code)) }
                 }.resume()
             }.resume()
+        }
+    }
+}
+
+// MARK: - reading through your browser session
+
+/// A hidden, logged-in web view kept alive behind the app. Reddit refuses New, search and the
+/// "load more comments" API to the app's own requests, but serves them to a real browser carrying
+/// your session — so these go through here: it loads reddit.com (passing Reddit's bot/JS check the
+/// way Safari does), then runs `fetch` for reddit.com's own .json from inside that page.
+final class WebReddit: NSObject, WKNavigationDelegate {
+    static let shared = WebReddit()
+    private var web: WKWebView?
+    private var ready = false
+    private var pending: [() -> Void] = []
+
+    private func keyWindow() -> UIWindow? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow } ?? UIApplication.shared.windows.first
+    }
+
+    private func ensure() {
+        guard web == nil else { return }
+        let c = WKWebViewConfiguration()
+        c.websiteDataStore = .default()              // the same cookie jar your sign-in used
+        c.applicationNameForUserAgent = safariSuffix
+        let w = WKWebView(frame: CGRect(x: 0, y: 0, width: 2, height: 2), configuration: c)
+        w.navigationDelegate = self
+        w.isUserInteractionEnabled = false
+        w.alpha = 0.01
+        keyWindow()?.addSubview(w)                   // attached to the window so iOS keeps it running
+        keyWindow()?.sendSubviewToBack(w)
+        web = w
+        w.load(URLRequest(url: URL(string: "https://www.reddit.com/")!))
+        // don't wait forever for a full render; the page's session is usable well before that
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.markReady() }
+    }
+
+    func webView(_ w: WKWebView, didCommit navigation: WKNavigation!) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.markReady() }
+    }
+
+    func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) { markReady() }
+
+    private func markReady() {
+        guard !ready, web != nil else { return }
+        ready = true
+        let p = pending; pending = []
+        p.forEach { $0() }
+    }
+
+    func get(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
+        DispatchQueue.main.async {
+            let run = { [weak self] in self?.doFetch(path, q, done: done) }
+            self.ensure()
+            if self.ready { run() } else { self.pending.append(run) }
+        }
+    }
+
+    private func doFetch(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
+        guard let web = web else { done(.failure(.offline("Reddit won't show this. (web view not ready)"))); return }
+        var p = path.hasPrefix("/") ? path : "/" + path
+        while p.count > 1, p.hasSuffix("/") { p.removeLast() }
+        if p.hasSuffix(".json") { p.removeLast(5) }
+        var c = URLComponents()
+        c.scheme = "https"; c.host = "www.reddit.com"; c.path = (p.isEmpty ? "/" : p) + ".json"
+        c.queryItems = [URLQueryItem(name: "raw_json", value: "1")] + q.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
+        guard let u = c.url else { done(.failure(.bad)); return }
+        // fetch from inside the page: same-origin, your cookies, the clearance the page already earned
+        let js = "try { const r = await fetch(u, {credentials:'include', headers:{'Accept':'application/json'}}); return r.status + '\\u0001' + (await r.text()); } catch(e) { return '0\\u0001' + e; }"
+        web.callAsyncJavaScript(js, arguments: ["u": u.absoluteString], in: nil, in: .page) { res in
+            DispatchQueue.main.async {
+                guard case .success(let v) = res, let s = v as? String, let sep = s.firstIndex(of: "\u{1}") else {
+                    Reddit.diag = "web \(c.path): no reply"
+                    done(.failure(.offline("Reddit won't show this.\n\n" + Reddit.diag))); return
+                }
+                let code = Int(s[..<sep]) ?? 0
+                let body = String(s[s.index(after: sep)...])
+                if (200 ..< 300).contains(code), let d = body.data(using: .utf8), let j = try? JSONSerialization.jsonObject(with: d) {
+                    done(.success(j))
+                } else {
+                    Reddit.diag = "web www.reddit\(c.path) http=\(code) \(body.prefix(60).replacingOccurrences(of: "\n", with: " "))"
+                    done(.failure(.offline("Reddit won't show this.\n\n" + Reddit.diag)))
+                }
+            }
         }
     }
 }
