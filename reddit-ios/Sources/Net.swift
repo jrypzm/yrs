@@ -113,9 +113,15 @@ final class Reddit {
                 return
             }
             if (code == 401 || code == 403), refresh {
-                self.token(refresh: true) { fresh in
-                    if let fresh = fresh, fresh != token { self.call(path, q, token: fresh, refresh: false, done: done) }
-                    else { DispatchQueue.main.async { done(.failure(.http(code))) } }
+                // oauth restricts /new and comment pages; read those the way your browser does —
+                // old.reddit.com's .json with your login cookies (which Reddit serves fully).
+                if self.isSignedIn {
+                    self.viaOldReddit(path, q) { r2 in
+                        if case .success = r2 { DispatchQueue.main.async { done(r2) } }
+                        else { self.retryWithFreshToken(path, q, token: token, code: code, done: done) }
+                    }
+                } else {
+                    self.retryWithFreshToken(path, q, token: token, code: code, done: done)
                 }
                 return
             }
@@ -126,6 +132,39 @@ final class Reddit {
             else { r = .failure(.bad) }
             DispatchQueue.main.async { done(r) }
         }.resume()
+    }
+
+    private func retryWithFreshToken(_ path: String, _ q: [String: String], token old: String, code: Int, done: @escaping (Result<Any, APIError>) -> Void) {
+        token(refresh: true) { fresh in
+            if let fresh = fresh, fresh != old { self.call(path, q, token: fresh, refresh: false, done: done) }
+            else { DispatchQueue.main.async { done(.failure(.http(code))) } }
+        }
+    }
+
+    /// Fetches old.reddit.com/<path>.json with your login cookies — the same request your Safari
+    /// makes, so Reddit serves the feeds (New) and comment pages it refuses over the API.
+    private func viaOldReddit(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            let header = cookies.filter { $0.domain.hasSuffix("reddit.com") }.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+            var p = path.hasPrefix("/") ? path : "/" + path
+            while p.count > 1, p.hasSuffix("/") { p.removeLast() }
+            if p.hasSuffix(".json") { p.removeLast(5) }
+            var c = URLComponents()
+            c.scheme = "https"; c.host = "old.reddit.com"; c.path = (p.isEmpty ? "/" : p) + ".json"
+            c.queryItems = [URLQueryItem(name: "raw_json", value: "1")] + q.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
+            guard let u = c.url else { DispatchQueue.main.async { done(.failure(.bad)) }; return }
+            var req = URLRequest(url: u)
+            req.setValue(safariUA, forHTTPHeaderField: "User-Agent")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            if !header.isEmpty { req.setValue(header, forHTTPHeaderField: "Cookie") }
+            self.session.dataTask(with: req) { data, resp, _ in
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let r: Result<Any, APIError>
+                if (200 ..< 300).contains(code), let d = data, let j = try? JSONSerialization.jsonObject(with: d) { r = .success(j) }
+                else { r = .failure(.http(code)) }
+                DispatchQueue.main.async { done(r) }
+            }.resume()
+        }
     }
 
     // MARK: the guest token — a plain HTTP request (no browser, no JavaScript), so iOS 15 handles it.
