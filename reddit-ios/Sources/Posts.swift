@@ -141,7 +141,7 @@ enum Lists {
     static func sub(_ name: String) -> Feed {
         let f = feed("r/" + name, choices: sorts) { sortPath("/r/" + name, $0) }
         f.navigationItem.title = "r/" + name
-        f.navigationItem.rightBarButtonItems = Reddit.shared.isSignedIn ? [StarButton(name), JoinButton(name)] : [StarButton(name)]
+        f.navigationItem.rightBarButtonItem = StarButton(name)
         return f
     }
 

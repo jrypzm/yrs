@@ -113,6 +113,7 @@ final class PostVC: UIViewController, UITextViewDelegate {
     private let picture = UIImageView()
     private let badge = UILabel()
     private var media = Media.none
+    private var joinSet = false
 
     init(_ p: Post) {
         post = p
@@ -161,9 +162,15 @@ final class PostVC: UIViewController, UITextViewDelegate {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Safari", style: .plain, target: self, action: #selector(inSafari))
         render()
         load()
+    }
+
+    /// A "Join" button for this post's subreddit, added once its name is known (right after it loads).
+    private func setJoin() {
+        guard !joinSet, Reddit.shared.isSignedIn, !post.sub.isEmpty else { return }
+        joinSet = true
+        navigationItem.rightBarButtonItem = JoinButton(post.sub)
     }
 
     @objc private func load() {
@@ -181,7 +188,7 @@ final class PostVC: UIViewController, UITextViewDelegate {
                 s.comments = parts.count > 1 ? parts[1].o("data").a("children") : []
                 s.failure = nil
             case .failure(let e):
-                s.failure = e.description + "\n\nTap \u{201C}Safari\u{201D} (top right) to read this post with its comments."
+                s.failure = e.description
             }
             s.render()
         }
@@ -232,11 +239,25 @@ final class PostVC: UIViewController, UITextViewDelegate {
         }
         layoutPicture()
 
+        setJoin()
         let d = Doc()
         if !post.title.isEmpty {
             d.text(post.title, Style.bold(19), .white, Style.para(after: 6))
             let j = post.j
-            d.text(joined(["r/" + post.sub, "u/" + post.author, count(j.i("score")) + " points", ago(j.d("created_utc"))]), .systemFont(ofSize: 13), Style.dim, Style.para(after: 2))
+            // r/sub and u/author are tappable — they open the subreddit and the person's page
+            let small = UIFont.systemFont(ofSize: 13)
+            let dim: [NSAttributedString.Key: Any] = [.font: small, .foregroundColor: Style.dim]
+            let line = NSMutableAttributedString()
+            if !post.sub.isEmpty, let u = URL(string: "https://www.reddit.com/r/\(post.sub)") {
+                line.append(NSAttributedString(string: "r/" + post.sub, attributes: [.font: small, .foregroundColor: Style.link, .link: u]))
+                line.append(NSAttributedString(string: " · ", attributes: dim))
+            }
+            if !post.author.isEmpty, post.author != "[deleted]", let u = URL(string: "https://www.reddit.com/user/\(post.author)") {
+                line.append(NSAttributedString(string: "u/" + post.author, attributes: [.font: small, .foregroundColor: Style.link, .link: u]))
+                line.append(NSAttributedString(string: " · ", attributes: dim))
+            }
+            line.append(NSAttributedString(string: joined([count(j.i("score")) + " points", ago(j.d("created_utc"))]), attributes: dim))
+            d.add(line, Style.para(after: 2))
             let tags = joined([post.nsfw ? "NSFW" : "", j.b("spoiler") ? "spoiler" : "", j.s("link_flair_text")])
             if !tags.isEmpty { d.text(tags, .systemFont(ofSize: 13), Style.link, Style.para(after: 2)) }
             d.gap(6)

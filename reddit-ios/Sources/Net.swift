@@ -348,38 +348,14 @@ final class Reddit {
     /// Whether you already follow r/<name> (nil if unknown or not signed in), so the button reads right.
     func subStatus(_ name: String, done: @escaping (Bool?) -> Void) {
         guard isSignedIn else { done(nil); return }
-        get("/r/\(name)/about") { r in
-            if case .success(let j) = r { done((j as? JSON)?.o("data").b("user_is_subscriber")) }
-            else { done(nil) }
-        }
+        WebReddit.shared.subStatus(name, done: done)
     }
 
-    /// Follow or unfollow r/<name>, the way the site does it: your login cookies plus the page's modhash.
+    /// Follow or unfollow r/<name>. Reddit blocks the plain /api/subscribe call now, so this runs in
+    /// the logged-in web view (which clears the bot-check), reading the modhash and posting as the site does.
     func subscribe(_ name: String, join: Bool, done: @escaping (Bool) -> Void) {
         guard isSignedIn else { DispatchQueue.main.async { done(false) }; return }
-        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-            let header = cookies.filter { $0.domain.hasSuffix("reddit.com") }.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
-            guard !header.isEmpty else { DispatchQueue.main.async { done(false) }; return }
-            var me = URLRequest(url: URL(string: "https://old.reddit.com/api/me.json?raw_json=1")!)
-            me.setValue(safariUA, forHTTPHeaderField: "User-Agent")
-            me.setValue(header, forHTTPHeaderField: "Cookie")
-            me.setValue("application/json", forHTTPHeaderField: "Accept")
-            self.session.dataTask(with: me) { data, _, _ in
-                let modhash = (data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? JSON)?.o("data").s("modhash") ?? ""
-                guard !modhash.isEmpty else { DispatchQueue.main.async { done(false) }; return }
-                var req = URLRequest(url: URL(string: "https://old.reddit.com/api/subscribe")!)
-                req.httpMethod = "POST"
-                req.setValue(safariUA, forHTTPHeaderField: "User-Agent")
-                req.setValue(header, forHTTPHeaderField: "Cookie")
-                req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-                let sr = name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? name
-                req.httpBody = Data("action=\(join ? "sub" : "unsub")&sr_name=\(sr)&uh=\(modhash)&api_type=json&skip_initial_defaults=true".utf8)
-                self.session.dataTask(with: req) { _, resp, _ in
-                    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                    DispatchQueue.main.async { done((200 ..< 300).contains(code)) }
-                }.resume()
-            }.resume()
-        }
+        WebReddit.shared.subscribe(name, join: join, done: done)
     }
 }
 
@@ -438,11 +414,60 @@ final class WebReddit: NSObject, WKNavigationDelegate {
         p.forEach { $0() }
     }
 
-    func get(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
+    /// Run `work` once the web view has loaded and cleared the bot-check (now, or when it's ready).
+    private func whenReady(_ work: @escaping () -> Void) {
         DispatchQueue.main.async {
-            let run: () -> Void = { self.doFetch(path, q, attempt: 0, done: done) }   // singleton, safe to hold
             self.ensure()
-            if self.ready { run() } else { self.pending.append(run) }
+            if self.ready { work() } else { self.pending.append(work) }
+        }
+    }
+
+    func get(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
+        whenReady { self.doFetch(path, q, attempt: 0, done: done) }
+    }
+
+    /// Whether you follow r/<name>, read through the browser session (about.json inside the page).
+    func subStatus(_ name: String, done: @escaping (Bool?) -> Void) {
+        whenReady {
+            guard let web = self.web else { done(nil); return }
+            let js = """
+            try {
+              const a = await (await fetch('https://old.reddit.com/r/' + encodeURIComponent(NAME) + '/about.json', {credentials:'include'})).json();
+              return (a && a.data && a.data.user_is_subscriber) ? 'YES' : 'NO';
+            } catch(e) { return '?'; }
+            """
+            web.callAsyncJavaScript(js, arguments: ["NAME": name], in: nil, in: .page) { res in
+                DispatchQueue.main.async {
+                    if case .success(let v) = res, let s = v as? String {
+                        done(s == "YES" ? true : (s == "NO" ? false : nil))
+                    } else { done(nil) }
+                }
+            }
+        }
+    }
+
+    /// Join/leave r/<name> from inside the page: read the modhash, then POST subscribe as the site does.
+    func subscribe(_ name: String, join: Bool, done: @escaping (Bool) -> Void) {
+        let action = join ? "sub" : "unsub"
+        whenReady {
+            guard let web = self.web else { DispatchQueue.main.async { done(false) }; return }
+            let js = """
+            try {
+              const me = await (await fetch('https://old.reddit.com/api/me.json', {credentials:'include'})).json();
+              const uh = (me && me.data && me.data.modhash) || '';
+              if (!uh) return 'NOUH';
+              const body = 'action=' + ACTION + '&sr_name=' + encodeURIComponent(NAME) + '&uh=' + encodeURIComponent(uh) + '&api_type=json&skip_initial_defaults=true';
+              const r = await fetch('https://old.reddit.com/api/subscribe', {method:'POST', credentials:'include', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body});
+              return 'HTTP' + r.status;
+            } catch(e) { return 'ERR:' + e; }
+            """
+            web.callAsyncJavaScript(js, arguments: ["NAME": name, "ACTION": action], in: nil, in: .page) { res in
+                DispatchQueue.main.async {
+                    var ok = false
+                    if case .success(let v) = res, let s = v as? String, s.hasPrefix("HTTP2") { ok = true }
+                    done(ok)
+                }
+            }
         }
     }
 
