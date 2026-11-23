@@ -869,17 +869,26 @@ final class SubmitVC: UIViewController, UITextViewDelegate {
         }
         navigationItem.rightBarButtonItem?.isEnabled = false
         navigationItem.rightBarButtonItem?.title = "Posting…"
-        Reddit.shared.submit(sr: sr, title: ttl, text: body) { [weak self] url in
+        Reddit.shared.submit(sr: sr, title: ttl, text: body) { [weak self] err in
             guard let s = self else { return }
-            if url != nil {
+            if err == nil {
                 s.dismiss(animated: true)
             } else {
                 s.navigationItem.rightBarButtonItem?.isEnabled = true
                 s.navigationItem.rightBarButtonItem?.title = "Post"
-                let a = UIAlertController(title: "Couldn't post", message: "Reddit wouldn't accept it — the subreddit may require you to be a member, may not allow text posts, or the title may break its rules.", preferredStyle: .alert)
+                let a = UIAlertController(title: "Couldn't post", message: err, preferredStyle: .alert)
                 a.addAction(UIAlertAction(title: "OK", style: .default))
                 s.present(a, animated: true)
             }
         }
     }
+}
+
+/// The view controller currently in front — used to show an alert from a nav-bar button.
+func topViewController() -> UIViewController? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    let win = scenes.flatMap { $0.windows }.first { $0.isKeyWindow } ?? UIApplication.shared.windows.first
+    var vc = win?.rootViewController
+    while let presented = vc?.presentedViewController { vc = presented }
+    return vc
 }

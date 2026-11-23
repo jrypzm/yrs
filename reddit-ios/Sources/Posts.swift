@@ -138,10 +138,20 @@ enum Lists {
         return (base + "/" + s, s == "top" ? ["t": "day"] : [:])
     }
 
+    /// Reddit's own "meta" feeds — not real subreddits, so no Join / post buttons on them.
+    static func isMeta(_ name: String) -> Bool {
+        ["popular", "all", "home", "front", "friends", "mod"].contains(name.lowercased())
+    }
+
     static func sub(_ name: String) -> Feed {
         let f = feed("r/" + name, choices: sorts) { sortPath("/r/" + name, $0) }
         f.navigationItem.title = "r/" + name
-        f.navigationItem.rightBarButtonItem = StarButton(name)
+        var items: [UIBarButtonItem] = [StarButton(name)]
+        if Reddit.shared.isSignedIn, !Lists.isMeta(name) {
+            items.insert(JoinButton(name), at: 0)       // Join on the subreddit page
+            items.insert(ComposeButton(sub: name), at: 0)   // ＋ to post to this subreddit (rightmost)
+        }
+        f.navigationItem.rightBarButtonItems = items
         return f
     }
 
@@ -247,11 +257,33 @@ final class JoinButton: UIBarButtonItem {
         let want = !(joined == true)
         busy = true
         title = "…"
-        Reddit.shared.subscribe(sr, join: want) { [weak self] ok in
+        Reddit.shared.subscribe(sr, join: want) { [weak self] err in
             guard let s = self else { return }
             s.busy = false
-            if ok { s.joined = want }   // on failure, keep the prior state and label
+            if err == nil { s.joined = want }   // on failure, keep the prior state and label
             s.show()
+            if let err = err, !err.isEmpty {
+                let verb = s.onWord == "Follow" ? "follow" : "join"
+                let a = UIAlertController(title: "Couldn't \(verb)", message: err, preferredStyle: .alert)
+                a.addAction(UIAlertAction(title: "OK", style: .default))
+                topViewController()?.present(a, animated: true)
+            }
         }
+    }
+}
+
+/// A pencil (✎) in the nav bar that opens the composer to post to a specific subreddit.
+final class ComposeButton: UIBarButtonItem {
+    private var sub = ""
+
+    convenience init(sub: String) {
+        self.init(barButtonSystemItem: .compose, target: nil, action: nil)
+        self.sub = sub
+        target = self
+        action = #selector(tap)
+    }
+
+    @objc private func tap() {
+        topViewController()?.present(UINavigationController(rootViewController: SubmitVC(sr: sub)), animated: true)
     }
 }
