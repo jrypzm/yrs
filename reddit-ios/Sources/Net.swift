@@ -351,23 +351,71 @@ final class Reddit {
         WebReddit.shared.subStatus(name, done: done)
     }
 
-    /// Follow or unfollow r/<name>, through the logged-in web view (modhash from the page, not the
-    /// blocked API). `done` gets Reddit's error text, or nil on success.
+    // MARK: writing — oauth.reddit.com with your account token (the route that still works in 2026;
+    // old.reddit 403s writes, and the .json modhash read is blocked). `done` gets Reddit's own error
+    // text, or nil on success. `confirm` checks the reply actually contains what proves it took.
+
+    private func oauthWrite(_ path: String, _ fields: [String: String], confirm: @escaping (JSON) -> Bool, done: @escaping (String?) -> Void) {
+        token(refresh: false) { [weak self] t in
+            guard let s = self, let t = t else { DispatchQueue.main.async { done("Couldn't get your Reddit token — open the menu and sign in again.") }; return }
+            s.writeCall(path, fields, token: t, confirm: confirm, retry: true, done: done)
+        }
+    }
+
+    private func writeCall(_ path: String, _ fields: [String: String], token: String, confirm: @escaping (JSON) -> Bool, retry: Bool, done: @escaping (String?) -> Void) {
+        var c = URLComponents(); c.scheme = "https"; c.host = "oauth.reddit.com"; c.path = path
+        guard let u = c.url else { DispatchQueue.main.async { done("Couldn't build the request.") }; return }
+        var req = URLRequest(url: u)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue(appUA, forHTTPHeaderField: "User-Agent")
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let ok = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        var all = fields; all["api_type"] = "json"
+        req.httpBody = all.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: ok) ?? "")" }.joined(separator: "&").data(using: .utf8)
+        session.dataTask(with: req) { data, resp, err in
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let j = (data.flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? JSON
+            // an expired token gives 401/403 with no Reddit error body — get a fresh one and try once more
+            if (code == 401 || code == 403), retry, j == nil {
+                self.token(refresh: true) { fresh in
+                    if let fresh = fresh, fresh != token { self.writeCall(path, fields, token: fresh, confirm: confirm, retry: false, done: done) }
+                    else { DispatchQueue.main.async { done("Reddit refused the write (\(code)).") } }
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                if (resp as? HTTPURLResponse) == nil { done(err.map { ($0 as NSError).code == NSURLErrorNotConnectedToInternet ? "No internet connection." : $0.localizedDescription } ?? "Couldn't reach Reddit."); return }
+                if let errors = (j?["json"] as? JSON)?["errors"] as? [[Any]], let first = errors.first {
+                    let msg = (first.count > 1 ? first[1] as? String : nil) ?? (first.first as? String) ?? "Reddit rejected it."
+                    done(msg); return
+                }
+                if !(200 ..< 300).contains(code) { done("Reddit refused the write (\(code)).") ; return }
+                if let j = j, confirm(j) { done(nil); return }
+                done("Reddit accepted it but didn't confirm it — it may not have gone through.")
+            }
+        }.resume()
+    }
+
+    /// Follow or unfollow r/<name>. `done` gets Reddit's error text, or nil on success.
     func subscribe(_ name: String, join: Bool, done: @escaping (String?) -> Void) {
         guard isSignedIn else { DispatchQueue.main.async { done("Sign in first.") }; return }
-        WebReddit.shared.subscribe(name, join: join, done: done)
+        oauthWrite("/api/subscribe", ["action": join ? "sub" : "unsub", "sr_name": name, "skip_initial_defaults": "true"],
+                   confirm: { _ in true }, done: done)   // subscribe returns {} on success; a Reddit error would be caught above
     }
 
     /// Reply to a post or comment (its fullname). `done` gets an error message, or nil on success.
     func reply(to fullname: String, text: String, done: @escaping (String?) -> Void) {
         guard isSignedIn else { DispatchQueue.main.async { done("Sign in first.") }; return }
-        WebReddit.shared.reply(to: fullname, text: text, done: done)
+        oauthWrite("/api/comment", ["thing_id": fullname, "text": text],
+                   confirm: { $0.o("json").o("data").a("things").count > 0 }, done: done)   // the created comment comes back
     }
 
     /// Submit a text post to r/<sr>. `done` gets an error message, or nil on success.
     func submit(sr: String, title: String, text: String, done: @escaping (String?) -> Void) {
         guard isSignedIn else { DispatchQueue.main.async { done("Sign in first.") }; return }
-        WebReddit.shared.submit(sr: sr, title: title, text: text, done: done)
+        oauthWrite("/api/submit", ["sr": sr, "kind": "self", "title": title, "text": text, "resubmit": "true", "sendreplies": "true"],
+                   confirm: { let d = $0.o("json").o("data"); return !d.s("url").isEmpty || !d.s("name").isEmpty }, done: done)
     }
 }
 
@@ -488,57 +536,8 @@ final class WebReddit: NSObject, WKNavigationDelegate {
         }
     }
 
-    /// Join/leave r/<name> from inside the page: read the modhash, then POST subscribe as the site does.
-    // The modhash is the write token. Reddit blocks /api/me.json (a .json read), but old.reddit puts
-    // the modhash right in the signed-in page we're already on — in r.config, or failing that, the HTML.
-    // Reads it, then posts the write the way old.reddit's own buttons do (uh in the body). `done` gets
-    // Reddit's own error text, or nil on success.
-    private static func writeJS(_ endpoint: String, _ bodyExpr: String) -> String {
-        """
-        try {
-          let uh = (window.r && window.r.config && window.r.config.modhash) || '';
-          if (!uh) { const m = document.documentElement.innerHTML.match(/"modhash": ?"([^"]+)"/); uh = m ? m[1] : ''; }
-          if (!uh) return 'ERR|You look signed out on Reddit — open the ⋯ menu and sign in again.';
-          const body = \(bodyExpr) + '&uh=' + encodeURIComponent(uh) + '&api_type=json';
-          const r = await fetch('https://old.reddit.com\(endpoint)', {method:'POST', credentials:'include', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body});
-          const t = await r.text();
-          let j = null; try { j = JSON.parse(t); } catch(e) {}
-          if (j && j.json && j.json.errors && j.json.errors.length) return 'ERR|' + (j.json.errors[0][1] || j.json.errors[0][0] || 'rejected');
-          if (r.status < 200 || r.status >= 300) return 'ERR|Reddit said ' + r.status;
-          return 'OK';
-        } catch(e) { return 'ERR|' + e; }
-        """
-    }
-
-    private func runWrite(_ js: String, _ args: [String: Any], done: @escaping (String?) -> Void) {
-        whenReady {
-            guard let web = self.web else { done("Not ready — pull down and try again."); return }
-            web.callAsyncJavaScript(js, arguments: args, in: nil, in: .page) { res in
-                DispatchQueue.main.async {
-                    guard case .success(let v) = res, let s = v as? String else { done("Couldn't reach Reddit."); return }
-                    if s == "OK" { done(nil) } else { done(String(s.dropFirst(4))) }   // drop "ERR|"
-                }
-            }
-        }
-    }
-
-    /// Follow/unfollow r/<name>. `done` gets Reddit's error text, or nil on success.
-    func subscribe(_ name: String, join: Bool, done: @escaping (String?) -> Void) {
-        let js = WebReddit.writeJS("/api/subscribe", "'action=' + ACTION + '&sr_name=' + encodeURIComponent(NAME) + '&skip_initial_defaults=true'")
-        runWrite(js, ["NAME": name, "ACTION": join ? "sub" : "unsub"], done: done)
-    }
-
-    /// Reply to a comment or post (its fullname, t1_/t3_). `done` gets an error message, or nil on success.
-    func reply(to fullname: String, text: String, done: @escaping (String?) -> Void) {
-        let js = WebReddit.writeJS("/api/comment", "'thing_id=' + encodeURIComponent(THING) + '&text=' + encodeURIComponent(TEXT)")
-        runWrite(js, ["THING": fullname, "TEXT": text], done: done)
-    }
-
-    /// Submit a self (text) post to r/<sr>. `done` gets an error message, or nil on success.
-    func submit(sr: String, title: String, text: String, done: @escaping (String?) -> Void) {
-        let js = WebReddit.writeJS("/api/submit", "'sr=' + encodeURIComponent(SR) + '&kind=self&title=' + encodeURIComponent(TITLE) + '&text=' + encodeURIComponent(TEXT) + '&resubmit=true&sendreplies=true'")
-        runWrite(js, ["SR": sr, "TITLE": title, "TEXT": text], done: done)
-    }
+    // Writes (subscribe / comment / submit) do NOT go through here — old.reddit 403s them. They run on
+    // oauth.reddit.com with the account token (Reddit.oauthWrite), which is the route that still works.
 
     private func doFetch(_ path: String, _ q: [String: String], attempt: Int, done: @escaping (Result<Any, APIError>) -> Void) {
         guard let web = web else { done(.failure(.offline("Reddit won't show this. (web view not ready)"))); return }

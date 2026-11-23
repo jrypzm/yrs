@@ -316,7 +316,8 @@ final class PostVC: UIViewController, UITextViewDelegate {
         let c = ComposeVC(title: "Reply", hint: "Your reply…") { [weak self] text, done in
             Reddit.shared.reply(to: fullname, text: text) { err in
                 done(err)
-                if err == nil { self?.load() }
+                // Reddit confirmed the comment; give it a couple of seconds to propagate, then refresh
+                if err == nil { DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { self?.load() } }
             }
         }
         present(UINavigationController(rootViewController: c), animated: true)

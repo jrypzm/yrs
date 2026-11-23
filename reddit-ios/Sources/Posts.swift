@@ -196,6 +196,18 @@ enum Favorites {
     }
 }
 
+/// Remembers what you've joined/followed in the app, so the button stays right across launches — the
+/// real "are you subscribed?" check (about.json) is one of the endpoints Reddit now blocks.
+enum Joined {
+    static func has(_ s: String) -> Bool { (UserDefaults.standard.stringArray(forKey: "joined") ?? []).contains { $0.lowercased() == s.lowercased() } }
+    static func set(_ s: String, _ yes: Bool) {
+        var a = UserDefaults.standard.stringArray(forKey: "joined") ?? []
+        a.removeAll { $0.lowercased() == s.lowercased() }
+        if yes { a.append(s) }
+        UserDefaults.standard.set(a, forKey: "joined")
+    }
+}
+
 /// ☆ adds the subreddit to the home screen, ★ takes it off.
 final class StarButton: UIBarButtonItem {
     private var name = ""
@@ -240,11 +252,8 @@ final class JoinButton: UIBarButtonItem {
         style = .plain
         target = self
         action = #selector(tap)
-        title = on
-        Reddit.shared.subStatus(sr) { [weak self] s in
-            self?.joined = s
-            self?.show()
-        }
+        joined = Joined.has(sr)          // what you did in the app last time (the real check is blocked)
+        show()
     }
 
     private func show() {
@@ -260,7 +269,7 @@ final class JoinButton: UIBarButtonItem {
         Reddit.shared.subscribe(sr, join: want) { [weak self] err in
             guard let s = self else { return }
             s.busy = false
-            if err == nil { s.joined = want }   // on failure, keep the prior state and label
+            if err == nil { s.joined = want; Joined.set(s.sr, want) }   // on failure, keep the prior state
             s.show()
             if let err = err, !err.isEmpty {
                 let verb = s.onWord == "Follow" ? "follow" : "join"
