@@ -229,20 +229,21 @@ final class StarButton: UIBarButtonItem {
     }
 }
 
-/// "Join"/"Joined ✓" for a subreddit, or "Follow"/"Following ✓" for a person — toggles the
-/// subscription on your real account (following a person is just subscribing to their u_ profile).
+/// The button always says what tapping it does: "Join" ⇄ "Leave" for a subreddit, "Follow" ⇄
+/// "Unfollow" for a person — so there's always a clear way out, not just a "Joined ✓" state badge.
+/// Toggles the subscription on your real account (following a person is just subscribing to u_<them>).
 final class JoinButton: UIBarButtonItem {
     private var sr = ""           // the subreddit to (un)subscribe: a name, or "u_<user>" for a follow
     private var onWord = "Join"
-    private var offWord = "Joined ✓"
+    private var offWord = "Leave"
     private var joined: Bool?
     private var busy = false
 
-    /// Join/leave a subreddit.
-    convenience init(_ name: String) { self.init(sr: name, on: "Join", off: "Joined ✓") }
+    /// Join/leave a subreddit — reads "Join" when you're out, "Leave" when you're in.
+    convenience init(_ name: String) { self.init(sr: name, on: "Join", off: "Leave") }
 
-    /// Follow/unfollow a person.
-    convenience init(follow user: String) { self.init(sr: "u_" + user, on: "Follow", off: "Following ✓") }
+    /// Follow/unfollow a person — reads "Follow" when you're not, "Unfollow" when you are.
+    convenience init(follow user: String) { self.init(sr: "u_" + user, on: "Follow", off: "Unfollow") }
 
     private convenience init(sr: String, on: String, off: String) {
         self.init()
