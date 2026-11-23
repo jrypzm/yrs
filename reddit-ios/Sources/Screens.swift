@@ -63,6 +63,7 @@ final class HomeVC: Feed, UISearchBarDelegate {
         }
         rows.append(Item(title: "Open a Reddit link", detail: "Paste a link to a post, subreddit or person.", action: { [weak self] in self?.openLink() }))
         if Reddit.shared.isSignedIn {
+            rows.append(Item(title: "Me", detail: "Your posts, your comments, and who replied to you", open: { Lists.me() }))
             rows.append(Item(title: "New post", detail: "Write a text post to a subreddit", action: { [weak self] in
                 self?.present(UINavigationController(rootViewController: SubmitVC()), animated: true)
             }))
@@ -588,6 +589,69 @@ final class MenuDots: UIBarButtonItem {
     }
 
     @objc private func tap() { run() }
+}
+
+/// An envelope in the nav bar that opens your inbox, with a red dot when you have unread replies.
+/// It checks your unread count itself — when it appears, and whenever the app returns to the front.
+final class InboxButton: UIBarButtonItem {
+    private var run: () -> Void = {}
+    private let b = UIButton(type: .system)
+    private let dot = UIView()
+
+    convenience init(_ run: @escaping () -> Void) {
+        self.init()
+        self.run = run
+        b.setTitle("✉", for: .normal)
+        b.titleLabel?.font = .systemFont(ofSize: 22)
+        b.tintColor = .white
+        b.frame = CGRect(x: 0, y: 0, width: 40, height: 40)
+        b.addTarget(self, action: #selector(tap), for: .touchUpInside)
+        dot.backgroundColor = UIColor(red: 1, green: 0.27, blue: 0.23, alpha: 1)
+        dot.frame = CGRect(x: 25, y: 7, width: 9, height: 9)
+        dot.layer.cornerRadius = 4.5
+        dot.isHidden = true
+        b.addSubview(dot)
+        customView = b
+        NotificationCenter.default.addObserver(self, selector: #selector(refresh), name: UIApplication.didBecomeActiveNotification, object: nil)
+        // check a few seconds in, once the web view has warmed up (so we don't force it early)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.refresh() }
+    }
+
+    @objc func refresh() {
+        guard Reddit.shared.isSignedIn else { dot.isHidden = true; return }
+        Reddit.shared.unread { [weak self] n in self?.dot.isHidden = n == 0 }
+    }
+
+    @objc private func tap() { run() }
+}
+
+/// A plain reader for a private message that has no thread to open.
+final class MessageVC: UIViewController {
+    private let from: String, subject: String, body: String
+
+    init(from: String, subject: String, body: String) {
+        self.from = from; self.subject = subject; self.body = body
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = subject.isEmpty ? "Message" : subject
+        view.backgroundColor = .black
+        let tv = UITextView()
+        tv.frame = view.bounds
+        tv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        tv.backgroundColor = .black
+        tv.isEditable = false
+        tv.textContainerInset = UIEdgeInsets(top: 16, left: 12, bottom: 24, right: 12)
+        let d = Doc()
+        d.text(from.isEmpty ? "message" : "from u/" + from, Style.bold(14), Style.dim, Style.para(after: 10))
+        Markdown.render(body, into: d)
+        tv.attributedText = d.result
+        view.addSubview(tv)
+    }
 }
 
 

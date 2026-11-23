@@ -42,6 +42,9 @@ class Feed: UITableViewController {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Start on a particular tab (call before the screen appears).
+    func select(_ i: Int) { choice = max(0, min(i, max(choices.count - 1, 0))) }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         tableView.backgroundColor = .black

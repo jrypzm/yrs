@@ -20,7 +20,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // opens on Reddit's normal homepage (Popular); the ⋯ in the corner opens everything else
         let home = Lists.sub("popular")
         let nav = UINavigationController(rootViewController: home)
-        home.navigationItem.rightBarButtonItem = MenuDots { [weak nav] in nav?.pushViewController(HomeVC(), animated: true) }
+        var right: [UIBarButtonItem] = [MenuDots { [weak nav] in nav?.pushViewController(HomeVC(), animated: true) }]
+        if Reddit.shared.isSignedIn {   // an envelope → your inbox, with a dot when someone's replied
+            right.append(InboxButton { [weak nav] in nav?.pushViewController(Lists.me(tab: 2), animated: true) })
+        }
+        home.navigationItem.rightBarButtonItems = right
         let w = UIWindow(frame: UIScreen.main.bounds)
         w.backgroundColor = .black
         w.overrideUserInterfaceStyle = .dark

@@ -107,6 +107,32 @@ enum Make {
         default: return nil
         }
     }
+
+    /// A row for one of your own comments — tapping it opens the thread it's in.
+    static func commentItem(_ child: JSON) -> Item? {
+        guard child.s("kind") == "t1" else { return nil }
+        let d = child.o("data")
+        let body = d.s("body")
+        let meta = joined(["r/" + d.s("subreddit"), count(d.i("score")) + " points", ago(d.d("created_utc"))])
+        let perma = d.s("permalink")
+        return Item(title: body.isEmpty ? "(comment)" : body, detail: meta,
+                    open: { perma.isEmpty ? nil : PostVC(permalink: perma) })
+    }
+
+    /// A row for one inbox item — a reply opens its thread; a plain message opens its text.
+    static func messageItem(_ child: JSON) -> Item? {
+        let d = child.o("data")
+        let author = d.s("author"), body = d.s("body"), sub = d.s("subreddit"), subject = d.s("subject")
+        let where_ = d.b("was_comment") ? ("replied" + (sub.isEmpty ? "" : " in r/" + sub)) : "messaged you"
+        let detail = joined([(d.b("new") ? "• " : "") + "u/" + (author.isEmpty ? "someone" : author), where_, ago(d.d("created_utc"))])
+        var perma = d.s("context")
+        if let q = perma.firstIndex(of: "?") { perma = String(perma[..<q]) }   // the thread loads; a context= tail would break it
+        return Item(title: body.isEmpty ? (subject.isEmpty ? "(message)" : subject) : body, detail: detail,
+                    open: {
+                        if perma.isEmpty { return MessageVC(from: author, subject: subject, body: body) }
+                        return PostVC(permalink: perma)
+                    })
+    }
 }
 
 /// Remembers where the next page starts.
@@ -182,6 +208,44 @@ enum Lists {
             if sort == "top" { p["t"] = "all" }
             return ("/search", p)
         }
+    }
+
+    /// Your dashboard: your posts, your comments, and your inbox (who replied). Needs you signed in.
+    /// Each tab reads through the logged-in browser session, the same route New and search use.
+    static func me(tab: Int = 0) -> Feed {
+        let cur = Cursor()
+        let f = Feed("Me", choices: ["Posts", "Comments", "Inbox"]) { choice, page, done in
+            if page == 1 { cur.after = nil }
+            Reddit.shared.myName { name in
+                guard let name = name, !name.isEmpty else {
+                    done(.failure(.offline("Couldn't tell who you're signed in as. Open the menu and sign in again."))); return
+                }
+                var q: [String: String] = ["limit": "25"]
+                if let a = cur.after { q["after"] = a }
+                let path: String
+                switch choice {
+                case 1: path = "/user/\(name)/comments"
+                case 2: path = "/message/inbox"
+                default: path = "/user/\(name)/submitted"
+                }
+                Reddit.shared.get(path, q) { r in
+                    done(r.map { j in
+                        let d = (j as? JSON)?.o("data") ?? [:]
+                        cur.after = d["after"] as? String
+                        let rows: [Item] = d.a("children").compactMap { c in
+                            switch choice {
+                            case 1: return Make.commentItem(c)
+                            case 2: return Make.messageItem(c)
+                            default: return Make.item(c)
+                            }
+                        }
+                        return (rows, cur.after != nil)
+                    })
+                }
+            }
+        }
+        f.select(tab)
+        return f
     }
 }
 

@@ -134,7 +134,8 @@ final class Reddit {
         while p.hasPrefix("/") { p.removeFirst() }
         while p.count > 1, p.hasSuffix("/") { p.removeLast() }
         if p.hasSuffix(".json") { p.removeLast(5) }
-        return p == "new" || p.hasSuffix("/new") || p == "search" || p.hasSuffix("/search") || p.hasPrefix("user/")
+        return p == "new" || p.hasSuffix("/new") || p == "search" || p.hasSuffix("/search")
+            || p.hasPrefix("user/") || p.hasPrefix("message/")   // your posts/comments and your inbox
     }
 
     private func oauthGet(_ path: String, _ q: [String: String], done: @escaping (Result<Any, APIError>) -> Void) {
@@ -329,10 +330,12 @@ final class Reddit {
     // MARK: signing in (optional — unlocks the feeds Reddit won't serve to a logged-out app)
 
     var isSignedIn: Bool { UserDefaults.standard.bool(forKey: "signedIn") }
+    private var cachedName: String?
 
     func signedIn(_ yes: Bool) {
         UserDefaults.standard.set(yes, forKey: "signedIn")
         cached = nil
+        if !yes { cachedName = nil; UserDefaults.standard.removeObject(forKey: "myname") }
         NotificationCenter.default.post(name: Reddit.signedIn, object: nil)
     }
 
@@ -349,6 +352,27 @@ final class Reddit {
     func subStatus(_ name: String, done: @escaping (Bool?) -> Void) {
         guard isSignedIn else { done(nil); return }
         WebReddit.shared.subStatus(name, done: done)
+    }
+
+    /// Who you're signed in as (cached once found), so the dashboard can load your posts and comments.
+    func myName(done: @escaping (String?) -> Void) {
+        if let n = cachedName, !n.isEmpty { done(n); return }
+        if let n = UserDefaults.standard.string(forKey: "myname"), !n.isEmpty { cachedName = n; done(n); return }
+        guard isSignedIn else { done(nil); return }
+        WebReddit.shared.whoami { [weak self] name, _ in
+            if let name = name, !name.isEmpty { self?.cachedName = name; UserDefaults.standard.set(name, forKey: "myname") }
+            done(name)
+        }
+    }
+
+    /// How many unread replies/messages you have, for the inbox dot (0 if signed out or unknown).
+    /// Passive: it won't build the web view early — if it isn't warm yet, the dot just waits.
+    func unread(done: @escaping (Int) -> Void) {
+        guard isSignedIn, WebReddit.shared.isReady else { done(0); return }
+        WebReddit.shared.whoami { [weak self] name, count in
+            if let name = name, !name.isEmpty { self?.cachedName = name; UserDefaults.standard.set(name, forKey: "myname") }
+            done(count)
+        }
     }
 
     // MARK: writing — oauth.reddit.com with your account token (the route that still works in 2026;
@@ -452,6 +476,10 @@ final class WebReddit: NSObject, WKNavigationDelegate {
             .first { $0.isKeyWindow } ?? UIApplication.shared.windows.first
     }
 
+    /// Whether the web view is up and past the bot-check — so a passive check (the inbox dot) can use
+    /// it without forcing it to build early and fight the first feed for memory on an older phone.
+    var isReady: Bool { ready && web != nil }
+
     /// Start loading the web view ahead of time (called at launch), so the first New/search is instant.
     func warmup() {
         // a few seconds after launch (so the first feed loads smoothly first), then load in the background
@@ -550,6 +578,11 @@ final class WebReddit: NSObject, WKNavigationDelegate {
         var p = path.hasPrefix("/") ? path : "/" + path
         while p.count > 1, p.hasSuffix("/") { p.removeLast() }
         if p.hasSuffix(".json") { p.removeLast(5) }
+        // pick the reader for this kind of page: your inbox, a person's comments, or a list of posts
+        let scraper: String
+        if p.hasPrefix("/message/") { scraper = WebReddit.inboxJS }
+        else if p.hasSuffix("/comments") { scraper = WebReddit.commentJS }
+        else { scraper = WebReddit.scrapeJS }
         // the HTML page (NOT .json) — Reddit still serves this to a real browser, and old.reddit
         // renders ~25 posts right in the markup, where /new.json gets the 403 block page.
         var c = URLComponents()
@@ -560,18 +593,20 @@ final class WebReddit: NSObject, WKNavigationDelegate {
         }
         if !items.isEmpty { c.queryItems = items }
         guard let u = c.url else { done(.failure(.bad)); return }
-        web.callAsyncJavaScript(WebReddit.scrapeJS, arguments: ["u": u.absoluteString], in: nil, in: .page) { res in
+        web.callAsyncJavaScript(scraper, arguments: ["u": u.absoluteString], in: nil, in: .page) { res in
             DispatchQueue.main.async {
                 var out = ""
                 if case .success(let v) = res, let s = v as? String { out = s }
                 if out.hasPrefix("{"), let d = out.data(using: .utf8),
                    let j = try? JSONSerialization.jsonObject(with: d) as? JSON {
                     let kids = j.o("data").a("children").count
+                    let dg = j["_diag"] as? JSON ?? [:]
                     if kids > 0 { done(.success(j)); return }
-                    // zero posts: a genuinely empty page, or the markup changed / got challenged
+                    // zero rows that read fine and aren't blocked = a genuinely empty page (no comments
+                    // yet, empty inbox): hand it back as empty. Only blocked/half-loaded is an error.
+                    if !dg.b("blocked"), dg.i("len") > 2000 { done(.success(j)); return }
                     if attempt > 0 {
-                        let dg = j["_diag"] as? JSON ?? [:]
-                        Reddit.diag = "web old.reddit\(c.path): 0 posts things=\(dg.i("things")) blocked=\(dg.b("blocked")) len=\(dg.i("len"))"
+                        Reddit.diag = "web old.reddit\(c.path): 0 rows things=\(dg.i("things")) blocked=\(dg.b("blocked")) len=\(dg.i("len"))"
                         done(.failure(.offline("Reddit won't show this.\n\n" + Reddit.diag)))
                         return
                     }
@@ -661,6 +696,111 @@ final class WebReddit: NSObject, WKNavigationDelegate {
       if (nb) { try { after = new URL(nb.href).searchParams.get('after'); } catch(e) {} }
       const blocked = html.indexOf('blocked by network security') >= 0 || html.indexOf('whoa there') >= 0;
       return JSON.stringify({kind:'Listing', data:{children: children, after: after}, _diag:{len: html.length, things: things.length, blocked: blocked}});
+    } catch(e) { return 'ERR:' + e; }
+    """
+
+    /// Your username and unread count, read from your logged-in old.reddit homepage.
+    func whoami(done: @escaping (String?, Int) -> Void) {
+        whenReady {
+            guard let web = self.web else { done(nil, 0); return }
+            let js = """
+            try {
+              const r = await fetch('https://old.reddit.com/', {credentials:'include', headers:{'Accept':'text/html'}});
+              const html = await r.text();
+              const doc = new DOMParser().parseFromString(html, 'text/html');
+              const a = doc.querySelector('#header-bottom-right .user a');
+              let name = a ? a.textContent.trim() : '';
+              if (!name || name.toLowerCase() === 'login') {
+                let k = '"logged": "'; let i = html.indexOf(k);
+                if (i < 0) { k = '"logged":"'; i = html.indexOf(k); }
+                if (i >= 0) { const j = html.indexOf('"', i + k.length); if (j > i) name = html.slice(i + k.length, j); }
+              }
+              const mail = doc.querySelector('#mail');
+              const have = mail ? mail.classList.contains('havemail') : false;
+              const mc = doc.querySelector('#mail-count');
+              let count = mc ? (parseInt((mc.textContent||'').replace(/[^0-9]/g,'')) || 0) : 0;
+              if (!count && have) count = 1;
+              return JSON.stringify({name: name, count: count});
+            } catch(e) { return ''; }
+            """
+            web.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { res in
+                DispatchQueue.main.async {
+                    if case .success(let v) = res, let s = v as? String, let d = s.data(using: .utf8),
+                       let j = (try? JSONSerialization.jsonObject(with: d)) as? JSON {
+                        let name = j.s("name")
+                        done(name.isEmpty ? nil : name, j.i("count"))
+                    } else { done(nil, 0) }
+                }
+            }
+        }
+    }
+
+    /// Lifts your comments out of old.reddit's /user/<you>/comments HTML (that .json is blocked).
+    static let commentJS = """
+    try {
+      const r = await fetch(u, {credentials:'include', headers:{'Accept':'text/html'}});
+      const html = await r.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const num = s => { const n = parseInt((s||'').replace(/[^0-9]/g,'')); return isNaN(n) ? 0 : n; };
+      let children = [];
+      const things = [].slice.call(doc.querySelectorAll('.thing.comment'));
+      for (const t of things) {
+        const d = t.dataset;
+        if (!d.fullname || d.fullname.indexOf('t1_') !== 0) continue;
+        const md = t.querySelector('.usertext-body .md') || t.querySelector('.md');
+        const sc = t.querySelector('.score.unvoted');
+        const time = t.querySelector('time');
+        let ts = 0; if (time) { const dt = time.getAttribute('datetime'); if (dt) ts = Date.parse(dt) / 1000; }
+        const by = t.querySelector('a.bylink');
+        children.push({kind:'t1', data:{
+          id: d.fullname.slice(3), name: d.fullname,
+          author: d.author || '', subreddit: d.subreddit || '',
+          body: md ? md.textContent.trim() : '',
+          permalink: d.permalink || (by ? by.getAttribute('href') : '') || '',
+          score: d.score ? num(d.score) : (sc ? num(sc.getAttribute('title') || sc.textContent) : 0),
+          created_utc: ts || ((parseInt(d.timestamp) || 0) / 1000)
+        }});
+      }
+      let after = null;
+      const nb = doc.querySelector('.next-button a');
+      if (nb) { try { after = new URL(nb.href).searchParams.get('after'); } catch(e) {} }
+      const blocked = html.indexOf('blocked by network security') >= 0 || html.indexOf('whoa there') >= 0;
+      return JSON.stringify({kind:'Listing', data:{children: children, after: after}, _diag:{len: html.length, things: things.length, blocked: blocked}});
+    } catch(e) { return 'ERR:' + e; }
+    """
+
+    /// Lifts your inbox — replies to you and messages — out of old.reddit's /message HTML.
+    static let inboxJS = """
+    try {
+      const r = await fetch(u, {credentials:'include', headers:{'Accept':'text/html'}});
+      const html = await r.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      let children = [];
+      const things = [].slice.call(doc.querySelectorAll('#siteTable .thing.message, .thing.message'));
+      for (const t of things) {
+        const d = t.dataset;
+        const au = t.querySelector('.sender a.author') || t.querySelector('a.author');
+        const subj = t.querySelector('.subject');
+        const md = t.querySelector('.md');
+        const time = t.querySelector('time');
+        let ts = 0; if (time) { const dt = time.getAttribute('datetime'); if (dt) ts = Date.parse(dt) / 1000; }
+        let ctx = '';
+        const cl = t.querySelector('a.context') || t.querySelector('.subject a[href*="/comments/"]');
+        if (cl) { ctx = cl.getAttribute('href') || ''; if (ctx.indexOf('http') === 0) { try { ctx = new URL(ctx).pathname; } catch(e) {} } }
+        let sub = d.subreddit || '';
+        if (!sub && ctx) { const parts = ctx.split('/'); for (let i = 0; i < parts.length - 1; i++) { if (parts[i] === 'r') { sub = parts[i + 1]; break; } } }
+        children.push({kind:'message', data:{
+          author: au ? au.textContent.trim() : (d.author || ''),
+          subject: subj ? subj.textContent.trim() : '',
+          body: md ? md.textContent.trim() : '',
+          context: ctx, subreddit: sub,
+          was_comment: !!cl || t.classList.contains('comment'),
+          new: t.classList.contains('new'),
+          created_utc: ts
+        }});
+      }
+      const blocked = html.indexOf('blocked by network security') >= 0 || html.indexOf('whoa there') >= 0;
+      return JSON.stringify({kind:'Listing', data:{children: children, after: null}, _diag:{len: html.length, things: things.length, blocked: blocked}});
     } catch(e) { return 'ERR:' + e; }
     """
 }
