@@ -112,6 +112,8 @@ final class PostVC: UIViewController, UITextViewDelegate {
     private var post: Post
     private var comments: [JSON]?
     private var failure: String?
+    private var highlightID: String?        // a just-posted comment to highlight
+    private var highlightAt: Int?           // where it landed in the text, so we can scroll to it
     private let tv = UITextView()
     private let picture = UIImageView()
     private let badge = UILabel()
@@ -225,6 +227,7 @@ final class PostVC: UIViewController, UITextViewDelegate {
     }
 
     private func render() {
+        highlightAt = nil
         let px = (width - 20) * UIScreen.main.scale
         media = post.j.isEmpty || post.title.isEmpty ? .none : post.media(px: px)
         var pic: Pic?
@@ -280,7 +283,7 @@ final class PostVC: UIViewController, UITextViewDelegate {
                 d.add(NSAttributedString(string: "＋ Add a comment", attributes: [.font: Style.bold(14), .foregroundColor: Style.link, .link: u]), Style.para(after: 10))
             }
             d.text(cs.isEmpty ? "No comments yet." : "\(count(post.j.i("num_comments"))) comments", Style.bold(15), Style.dim, Style.para(after: 10))
-            CommentDoc.render(cs, linkID: post.id.isEmpty ? "" : "t3_" + post.id, into: d)
+            highlightAt = CommentDoc.render(cs, linkID: post.id.isEmpty ? "" : "t3_" + post.id, highlight: highlightID, into: d)
         } else {
             d.gap(12)
             d.text("Loading comments…", Style.body, Style.dim)
@@ -310,17 +313,76 @@ final class PostVC: UIViewController, UITextViewDelegate {
         return false
     }
 
-    /// Opens the reply composer for a post or comment (its fullname); reloads to show the reply.
+    /// Opens the reply composer for a post or comment (its fullname); shows the reply in place.
     private func compose(replyTo fullname: String) {
         guard Reddit.shared.isSignedIn else { return }
         let c = ComposeVC(title: "Reply", hint: "Your reply…") { [weak self] text, done in
-            Reddit.shared.reply(to: fullname, text: text) { err in
+            Reddit.shared.reply(to: fullname, text: text) { err, comment in
                 done(err)
-                // Reddit confirmed the comment; give it a couple of seconds to propagate, then refresh
-                if err == nil { DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { self?.load() } }
+                // Drop the comment Reddit just handed back into the thread, highlight it, scroll to it —
+                // no waiting on a re-read (that endpoint is slow to show a brand-new reply, sometimes blocked).
+                if err == nil, let comment = comment { self?.addReply(comment, to: fullname) }
             }
         }
         present(UINavigationController(rootViewController: c), animated: true)
+    }
+
+    /// Puts a just-posted comment into the thread — a reply to the post goes on top, a reply to a
+    /// comment nests under it — then marks it so render() highlights it and we scroll there.
+    private func addReply(_ comment: JSON, to fullname: String) {
+        var node = comment
+        if node["created_utc"] == nil { node["created_utc"] = NSNumber(value: Date().timeIntervalSince1970) }
+        var cs = comments ?? []
+        if fullname.hasPrefix("t1_") {
+            cs = PostVC.insert(node, under: String(fullname.dropFirst(3)), into: cs)
+        } else {
+            node["depth"] = NSNumber(value: 0)
+            cs.insert(["kind": "t1", "data": node], at: 0)
+        }
+        comments = cs
+        highlightID = node.s("id")
+        failure = nil
+        render()
+        scrollToHighlight()
+    }
+
+    /// Finds the comment with `parentID` anywhere in the tree and nests `child` as its first reply.
+    static func insert(_ child: JSON, under parentID: String, into children: [JSON]) -> [JSON] {
+        var out = children
+        for i in out.indices {
+            guard out[i].s("kind") == "t1" else { continue }
+            var data = out[i].o("data")
+            if data.s("id") == parentID {
+                var kid = child
+                kid["depth"] = NSNumber(value: data.i("depth") + 1)
+                var repliesData = data.o("replies").o("data")
+                var kids = repliesData.a("children")
+                kids.insert(["kind": "t1", "data": kid], at: 0)
+                repliesData["children"] = kids
+                data["replies"] = ["kind": "Listing", "data": repliesData]
+                out[i]["data"] = data
+                return out
+            }
+            let kids = data.o("replies").o("data").a("children")
+            if !kids.isEmpty {
+                var repliesData = data.o("replies").o("data")
+                repliesData["children"] = insert(child, under: parentID, into: kids)
+                data["replies"] = ["kind": "Listing", "data": repliesData]
+                out[i]["data"] = data
+            }
+        }
+        return out
+    }
+
+    /// Scrolls so the highlighted comment is on screen (after layout settles).
+    private func scrollToHighlight() {
+        guard let at = highlightAt else { return }
+        DispatchQueue.main.async {
+            let len = self.tv.attributedText.length
+            guard len > 0 else { return }
+            let loc = max(0, min(at, len - 1))
+            self.tv.scrollRangeToVisible(NSRange(location: loc, length: min(1, len - loc)))
+        }
     }
 
     override func didReceiveMemoryWarning() {
@@ -611,13 +673,18 @@ enum Safari {
 enum CommentDoc {
     /// `linkID` is the post's fullname (t3_…), used to fetch collapsed replies. `baseDepth` pulls a
     /// sub-conversation back to the left margin so a drilled-in thread doesn't start half-way across.
-    static func render(_ children: [JSON], linkID: String, baseDepth: Int = 0, into d: Doc) {
-        for c in children { one(c, linkID: linkID, baseDepth: baseDepth, into: d) }
+    @discardableResult
+    static func render(_ children: [JSON], linkID: String, baseDepth: Int = 0, highlight: String? = nil, into d: Doc) -> Int? {
+        var at: Int?
+        for c in children { if let o = one(c, linkID: linkID, baseDepth: baseDepth, highlight: highlight, into: d) { at = at ?? o } }
+        return at
     }
 
     private static func indent(_ depth: Int, _ base: Int) -> CGFloat { CGFloat(min(max(depth - base, 0), 6)) * 14 }
 
-    private static func one(_ c: JSON, linkID: String, baseDepth: Int, into d: Doc) {
+    /// Lays out one comment and its replies. Returns where the highlighted comment began, if it's in here.
+    @discardableResult
+    private static func one(_ c: JSON, linkID: String, baseDepth: Int, highlight: String?, into d: Doc) -> Int? {
         let kind = c.s("kind")
         let j = c.o("data")
         let depth = j.i("depth")
@@ -636,21 +703,28 @@ enum CommentDoc {
                 d.gap(6)
             }
             d.indent = 0
-            return
+            return nil
         }
-        guard kind == "t1" else { return }
+        guard kind == "t1" else { return nil }
         d.indent = indent(depth, baseDepth)
+        let mine = highlight.map { !$0.isEmpty && $0 == j.s("id") } ?? false
+        let start = mine ? d.out.length : nil
         let shade = UIColor(white: max(0.32, 0.55 - CGFloat(max(depth - baseDepth, 0)) * 0.04), alpha: 1)
-        let headStr = joined(["u/" + j.s("author"), count(j.i("score")) + " points", ago(j.d("created_utc"))]) + (j.b("is_submitter") ? " · OP" : "")
-        let head = NSMutableAttributedString(string: headStr, attributes: [.font: Style.bold(13), .foregroundColor: shade])
+        let headStr = joined(["u/" + j.s("author"), count(j.i("score")) + " points", ago(j.d("created_utc"))]) + (j.b("is_submitter") ? " · OP" : "") + (mine ? " · you" : "")
+        let head = NSMutableAttributedString(string: headStr, attributes: [.font: Style.bold(13), .foregroundColor: mine ? Style.add : shade])
         if Reddit.shared.isSignedIn, !j.s("id").isEmpty, let u = URL(string: "yrsreply:t1_\(j.s("id"))") {
             head.append(NSAttributedString(string: "   reply", attributes: [.font: Style.bold(13), .foregroundColor: Style.link, .link: u]))
         }
         d.add(head, Style.para(after: 3))
         Markdown.render(j.s("body"), into: d)
+        if let start = start, d.out.length > start {
+            d.out.addAttribute(.backgroundColor, value: UIColor(white: 0.19, alpha: 1), range: NSRange(location: start, length: d.out.length - start))
+        }
         d.gap(4)
-        for r in j.o("replies").o("data").a("children") { one(r, linkID: linkID, baseDepth: baseDepth, into: d) }
+        var at = start
+        for r in j.o("replies").o("data").a("children") { if let o = one(r, linkID: linkID, baseDepth: baseDepth, highlight: highlight, into: d) { at = at ?? o } }
         d.indent = 0
+        return at
     }
 }
 

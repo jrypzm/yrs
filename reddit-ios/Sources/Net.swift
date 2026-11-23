@@ -355,16 +355,18 @@ final class Reddit {
     // old.reddit 403s writes, and the .json modhash read is blocked). `done` gets Reddit's own error
     // text, or nil on success. `confirm` checks the reply actually contains what proves it took.
 
-    private func oauthWrite(_ path: String, _ fields: [String: String], confirm: @escaping (JSON) -> Bool, done: @escaping (String?) -> Void) {
+    // `done` gets (errorText, responseJSON): error nil + the full reply on success, so a caller like
+    // the comment screen can use what Reddit handed back instead of re-reading a slow/blocked endpoint.
+    private func oauthWrite(_ path: String, _ fields: [String: String], confirm: @escaping (JSON) -> Bool, done: @escaping (String?, JSON?) -> Void) {
         token(refresh: false) { [weak self] t in
-            guard let s = self, let t = t else { DispatchQueue.main.async { done("Couldn't get your Reddit token — open the menu and sign in again.") }; return }
+            guard let s = self, let t = t else { DispatchQueue.main.async { done("Couldn't get your Reddit token — open the menu and sign in again.", nil) }; return }
             s.writeCall(path, fields, token: t, confirm: confirm, retry: true, done: done)
         }
     }
 
-    private func writeCall(_ path: String, _ fields: [String: String], token: String, confirm: @escaping (JSON) -> Bool, retry: Bool, done: @escaping (String?) -> Void) {
+    private func writeCall(_ path: String, _ fields: [String: String], token: String, confirm: @escaping (JSON) -> Bool, retry: Bool, done: @escaping (String?, JSON?) -> Void) {
         var c = URLComponents(); c.scheme = "https"; c.host = "oauth.reddit.com"; c.path = path
-        guard let u = c.url else { DispatchQueue.main.async { done("Couldn't build the request.") }; return }
+        guard let u = c.url else { DispatchQueue.main.async { done("Couldn't build the request.", nil) }; return }
         var req = URLRequest(url: u)
         req.httpMethod = "POST"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -380,42 +382,46 @@ final class Reddit {
             if (code == 401 || code == 403), retry, j == nil {
                 self.token(refresh: true) { fresh in
                     if let fresh = fresh, fresh != token { self.writeCall(path, fields, token: fresh, confirm: confirm, retry: false, done: done) }
-                    else { DispatchQueue.main.async { done("Reddit refused the write (\(code)).") } }
+                    else { DispatchQueue.main.async { done("Reddit refused the write (\(code)).", nil) } }
                 }
                 return
             }
             DispatchQueue.main.async {
-                if (resp as? HTTPURLResponse) == nil { done(err.map { ($0 as NSError).code == NSURLErrorNotConnectedToInternet ? "No internet connection." : $0.localizedDescription } ?? "Couldn't reach Reddit."); return }
+                if (resp as? HTTPURLResponse) == nil { done(err.map { ($0 as NSError).code == NSURLErrorNotConnectedToInternet ? "No internet connection." : $0.localizedDescription } ?? "Couldn't reach Reddit.", nil); return }
                 if let errors = (j?["json"] as? JSON)?["errors"] as? [[Any]], let first = errors.first {
                     let msg = (first.count > 1 ? first[1] as? String : nil) ?? (first.first as? String) ?? "Reddit rejected it."
-                    done(msg); return
+                    done(msg, nil); return
                 }
-                if !(200 ..< 300).contains(code) { done("Reddit refused the write (\(code)).") ; return }
-                if let j = j, confirm(j) { done(nil); return }
-                done("Reddit accepted it but didn't confirm it — it may not have gone through.")
+                if !(200 ..< 300).contains(code) { done("Reddit refused the write (\(code)).", nil) ; return }
+                if let j = j, confirm(j) { done(nil, j); return }
+                done("Reddit accepted it but didn't confirm it — it may not have gone through.", nil)
             }
         }.resume()
     }
 
-    /// Follow or unfollow r/<name>. `done` gets Reddit's error text, or nil on success.
+    /// Join/leave a subreddit (or follow/unfollow u_<name>). `done` gets Reddit's error text, or nil.
     func subscribe(_ name: String, join: Bool, done: @escaping (String?) -> Void) {
         guard isSignedIn else { DispatchQueue.main.async { done("Sign in first.") }; return }
-        oauthWrite("/api/subscribe", ["action": join ? "sub" : "unsub", "sr_name": name, "skip_initial_defaults": "true"],
-                   confirm: { _ in true }, done: done)   // subscribe returns {} on success; a Reddit error would be caught above
+        var fields = ["action": join ? "sub" : "unsub", "sr_name": name]
+        if join { fields["skip_initial_defaults"] = "true" }   // valid only with sub — Reddit 400s if it's sent with unsub
+        oauthWrite("/api/subscribe", fields, confirm: { _ in true }) { err, _ in done(err) }
     }
 
-    /// Reply to a post or comment (its fullname). `done` gets an error message, or nil on success.
-    func reply(to fullname: String, text: String, done: @escaping (String?) -> Void) {
-        guard isSignedIn else { DispatchQueue.main.async { done("Sign in first.") }; return }
+    /// Reply to a post or comment (its fullname). `done` gets an error (or nil) and, on success, the
+    /// freshly created comment, so the screen can show it right away without re-reading the thread.
+    func reply(to fullname: String, text: String, done: @escaping (String?, JSON?) -> Void) {
+        guard isSignedIn else { DispatchQueue.main.async { done("Sign in first.", nil) }; return }
         oauthWrite("/api/comment", ["thing_id": fullname, "text": text],
-                   confirm: { $0.o("json").o("data").a("things").count > 0 }, done: done)   // the created comment comes back
+                   confirm: { $0.o("json").o("data").a("things").count > 0 }) { err, j in
+            done(err, j?.o("json").o("data").a("things").first?.o("data"))
+        }
     }
 
     /// Submit a text post to r/<sr>. `done` gets an error message, or nil on success.
     func submit(sr: String, title: String, text: String, done: @escaping (String?) -> Void) {
         guard isSignedIn else { DispatchQueue.main.async { done("Sign in first.") }; return }
         oauthWrite("/api/submit", ["sr": sr, "kind": "self", "title": title, "text": text, "resubmit": "true", "sendreplies": "true"],
-                   confirm: { let d = $0.o("json").o("data"); return !d.s("url").isEmpty || !d.s("name").isEmpty }, done: done)
+                   confirm: { let d = $0.o("json").o("data"); return !d.s("url").isEmpty || !d.s("name").isEmpty }) { err, _ in done(err) }
     }
 }
 
