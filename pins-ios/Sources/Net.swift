@@ -103,6 +103,40 @@ struct Pin {
         }
         return nil
     }
+
+    /// A promoted pin — i.e. an ad. Pinterest slips these into the feed shaped like ordinary pins
+    /// (that Audi, that villa); only ad objects carry these fields, so organic pins are never dropped.
+    var isAd: Bool {
+        if (j["is_promoted"] as? NSNumber)?.boolValue == true { return true }
+        if (j["promoted_is_removable"] as? NSNumber)?.boolValue == true { return true }
+        if let s = j["ad_destination_url"] as? String, !s.isEmpty { return true }
+        if let p = j["promoter"] as? JSON, !p.isEmpty { return true }
+        if let s = j["ad_group_id"] as? String, !s.isEmpty { return true }
+        return false
+    }
+
+    /// Picture URLs to try when saving, best quality first: Pinterest's listed "orig", the biggest
+    /// listed size upgraded to the full-resolution /originals/ path, then that size itself.
+    var saveCandidates: [URL] {
+        let imgs = j.o("images")
+        var urls: [String] = []
+        if !imgs.o("orig").s("url").isEmpty { urls.append(imgs.o("orig").s("url")) }
+        let sized = ["736x", "600x", "564x", "474x", "236x", "170x"].compactMap { k -> (String, Int)? in
+            let im = imgs.o(k); let s = im.s("url"); return s.isEmpty ? nil : (s, im.i("width"))
+        }.sorted { $0.1 > $1.1 }
+        if let biggest = sized.first?.0 {
+            if let orig = Pin.originalize(biggest) { urls.append(orig) }
+            urls.append(biggest)
+        }
+        var seen = Set<String>()
+        return urls.filter { seen.insert($0).inserted }.compactMap { URL(string: $0) }
+    }
+
+    /// Rewrites an i.pinimg.com thumbnail URL (…/736x/…) to its full-resolution original (…/originals/…).
+    static func originalize(_ url: String) -> String? {
+        guard url.contains("i.pinimg.com"), let r = url.range(of: #"/\d+x/"#, options: .regularExpression) else { return nil }
+        return url.replacingCharacters(in: r, with: "/originals/")
+    }
 }
 
 /// One of your boards.
@@ -304,8 +338,10 @@ enum Pinterest {
             }
         }
         list.forEach(add)
-        // keep only real pictures, and drop duplicates the related modules can repeat
-        return out.filter { $0.image("236x") != nil && seen.insert($0.id.isEmpty ? UUID().uuidString : $0.id).inserted }
+        // keep real pictures only; drop promoted pins (ads) and duplicates the related modules repeat
+        return out.filter { p in
+            p.image("236x") != nil && !p.isAd && seen.insert(p.id.isEmpty ? UUID().uuidString : p.id).inserted
+        }
     }
 
     /// A POST to one of the website's `create` endpoints (saving a pin, making a board). Needs sign-in.

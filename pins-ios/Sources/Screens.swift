@@ -1,6 +1,7 @@
 // The screens: the home feed (main), welcome and sign-in, search, one pin, and pictures full screen.
 
 import AVKit
+import Photos
 import UIKit
 import WebKit
 
@@ -340,19 +341,37 @@ final class PinVC: GridVC {
     }
 
     /// The full-size picture goes to Photos; it's read, saved and let go of.
+    /// Saves the full-resolution original to Photos, keeping the original file bytes (no re-encoding).
+    /// Tries the best URL first, falling back if Pinterest 404s the /originals/ path.
     private func save() {
-        guard let (u, _) = pin.image("orig") ?? pin.image("736x") else { return }
-        URLSession.shared.dataTask(with: u) { d, _, _ in
-            let img = d.flatMap { UIImage(data: $0) }
-            DispatchQueue.main.async {
-                guard let i = img else { self.tell("Couldn't fetch the picture."); return }
-                UIImageWriteToSavedPhotosAlbum(i, self, #selector(self.saved(_:error:context:)), nil)
-            }
-        }.resume()
+        var candidates = pin.saveCandidates
+        guard !candidates.isEmpty else { tell("No picture to save."); return }
+        func attempt() {
+            guard !candidates.isEmpty else { tell("Couldn't fetch the picture."); return }
+            let u = candidates.removeFirst()
+            URLSession.shared.dataTask(with: u) { [weak self] d, resp, _ in
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    if let d = d, !d.isEmpty, (200 ..< 300).contains(code) { self.writeToPhotos(d) } else { attempt() }
+                }
+            }.resume()
+        }
+        attempt()
     }
 
-    @objc private func saved(_ image: UIImage, error: Error?, context: UnsafeMutableRawPointer?) {
-        tell(error == nil ? "Saved to Photos." : "Couldn't save: allow yrs. pins to add photos in Settings › Privacy › Photos.")
+    private func writeToPhotos(_ data: Data) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async { self?.tell("Allow yrs. pins to add photos in Settings › Privacy › Photos.") }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                PHAssetCreationRequest.forAsset().addResource(with: .photo, data: data, options: nil)
+            } completionHandler: { ok, err in
+                DispatchQueue.main.async { self?.tell(ok ? "Saved to Photos — full quality." : "Couldn't save: \(err?.localizedDescription ?? "try again").") }
+            }
+        }
     }
 
     private func tell(_ t: String) {
