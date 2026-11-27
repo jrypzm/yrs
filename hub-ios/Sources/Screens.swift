@@ -284,6 +284,7 @@ final class SearchHomeVC: UIViewController, UISearchBarDelegate {
     private let name = UILabel()
     private let hint = UILabel()
     private let bar = UISearchBar()
+    private let watching = UIButton(type: .system)
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -305,13 +306,23 @@ final class SearchHomeVC: UIViewController, UISearchBarDelegate {
         bar.autocorrectionType = .no
         bar.returnKeyType = .search
         bar.delegate = self
-        [name, hint, bar].forEach { view.addSubview($0) }
-        view.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard)))
+        watching.titleLabel?.font = .systemFont(ofSize: 15, weight: .medium)
+        watching.setTitleColor(Style.link, for: .normal)
+        watching.addTarget(self, action: #selector(openWatching), for: .touchUpInside)
+        watching.isHidden = true
+        [name, hint, bar, watching].forEach { view.addSubview($0) }
+        let tap = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
+        tap.cancelsTouchesInView = false   // so the Watching button still receives its taps
+        view.addGestureRecognizer(tap)
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         navigationController?.setNavigationBarHidden(true, animated: animated)
+        let n = Watchlist.repos.count
+        watching.setTitle(n > 0 ? "★  Watching (\(n))" : nil, for: .normal)
+        watching.isHidden = n == 0
+        view.setNeedsLayout()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -325,9 +336,12 @@ final class SearchHomeVC: UIViewController, UISearchBarDelegate {
         name.frame = CGRect(x: 0, y: mid, width: w, height: 54)
         hint.frame = CGRect(x: 24, y: mid + 62, width: w - 48, height: 40)
         bar.frame = CGRect(x: 18, y: mid + 112, width: w - 36, height: 56)
+        watching.frame = CGRect(x: 0, y: mid + 182, width: w, height: 30)
     }
 
     @objc private func dismissKeyboard() { bar.resignFirstResponder() }
+
+    @objc private func openWatching() { navigationController?.pushViewController(WatchingVC(), animated: true) }
 
     func searchBarSearchButtonClicked(_ b: UISearchBar) {
         let q = (b.text ?? "").trimmingCharacters(in: .whitespaces)
@@ -376,6 +390,26 @@ final class RepoVC: Feed {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        refreshWatchButton()
+    }
+
+    /// The ☆/★ in the top corner: tap to follow this repo for new releases (they show on the Watching screen).
+    private func refreshWatchButton() {
+        let on = Watchlist.isWatching(full)
+        let b = UIBarButtonItem(title: on ? "★" : "☆", style: .plain, target: self, action: #selector(toggleWatch))
+        let attrs: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 20)]
+        b.setTitleTextAttributes(attrs, for: .normal)
+        b.setTitleTextAttributes(attrs, for: .highlighted)
+        navigationItem.rightBarButtonItem = b
+    }
+
+    @objc private func toggleWatch() {
+        if Watchlist.isWatching(full) { Watchlist.unwatch(full) } else { Watchlist.watch(full) }
+        refreshWatchButton()
+    }
 
     private func load(_ done: @escaping Feed.Done) {
         if let j = preloaded {                       // from search: no request at all
