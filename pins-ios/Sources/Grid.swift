@@ -65,6 +65,7 @@ final class Masonry: UICollectionViewLayout {
 
 final class PinCell: UICollectionViewCell {
     let picture = UIImageView()
+    private let play = UILabel()
     private var task: URLSessionDataTask?
     private var url: URL?
 
@@ -74,6 +75,15 @@ final class PinCell: UICollectionViewCell {
         picture.clipsToBounds = true
         picture.layer.cornerRadius = 16
         contentView.addSubview(picture)
+        play.text = "▶"
+        play.font = .systemFont(ofSize: 13)
+        play.textColor = .white
+        play.textAlignment = .center
+        play.backgroundColor = UIColor(white: 0, alpha: 0.5)
+        play.layer.cornerRadius = 13
+        play.clipsToBounds = true
+        play.isHidden = true
+        picture.addSubview(play)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -81,15 +91,17 @@ final class PinCell: UICollectionViewCell {
     override func layoutSubviews() {
         super.layoutSubviews()
         picture.frame = contentView.bounds
+        play.frame = CGRect(x: 8, y: contentView.bounds.height - 34, width: 26, height: 26)
     }
 
     func show(_ p: Pin, width: CGFloat) {
         task?.cancel()
         picture.image = nil
         picture.backgroundColor = p.color
-        // grid thumbnails use Pinterest's small 236-wide picture: a quarter of the memory of the
-        // bigger size and much faster to fetch and decode. The full picture loads when you open a pin.
-        guard let (u, _) = p.image("236x") else { return }
+        play.isHidden = !p.isVideo          // a ▶ marks video and idea-pin cells
+        // grid thumbnails use Pinterest's small 236-wide picture: a quarter of the memory of the bigger
+        // size and much faster. Falls back to an idea/video cover. The full picture loads when you open a pin.
+        guard let (u, _) = p.gridImage("236x") else { return }
         url = u
         // the 236-wide source is already small; decode it at its own size (no shrinking, no upscaling)
         task = Images.load(u, px: 1024) { [weak self] img in
@@ -105,6 +117,7 @@ final class PinCell: UICollectionViewCell {
         task = nil
         url = nil
         picture.image = nil
+        play.isHidden = true
     }
 }
 
@@ -138,7 +151,7 @@ class GridVC: UICollectionViewController {
         super.viewDidLoad()
         layout.height = { [weak self] i, w in
             guard let p = self?.pins[i] else { return w }
-            let ratio = min(max(p.image("236x")?.1 ?? 1, 0.5), 2.2)
+            let ratio = min(max(p.gridImage("236x")?.1 ?? 1, 0.5), 2.2)
             return ceil(w * ratio)
         }
         collectionView.backgroundColor = .black

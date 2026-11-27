@@ -93,13 +93,45 @@ struct Pin {
             let urls = slides.compactMap { Pin.pick($0.o("images"), size)?.0 }
             if !urls.isEmpty { return urls }
         }
-        return (image("736x")?.0).map { [$0] } ?? []
+        return (image("736x")?.0 ?? gridImage("736x")?.0).map { [$0] } ?? []
     }
 
+    /// Plays a video pin, and the video pages/blocks of an idea pin. HLS first, then MP4 variants.
     var video: URL? {
-        let list = j.o("videos").o("video_list")
-        for k in ["V_HLSV4", "V_HLSV3_MOBILE", "V_720P", "V_EXP7", "V_EXP6", "V_EXP5", "V_EXP4"] {
-            if let u = URL(string: list.o(k).s("url")), !list.o(k).s("url").isEmpty { return u }
+        if let u = Pin.pickVideo(j.o("videos").o("video_list")) { return u }
+        for page in j.o("story_pin_data").a("pages") {
+            if let u = Pin.pickVideo(page.o("video").o("video_list")) { return u }
+            for block in page.a("blocks") { if let u = Pin.pickVideo(block.o("video").o("video_list")) { return u } }
+        }
+        return nil
+    }
+
+    /// Whether this is a video (for the ▶ badge in the grid), checked without building a URL.
+    var isVideo: Bool {
+        if !j.o("videos").o("video_list").isEmpty { return true }
+        for page in j.o("story_pin_data").a("pages") {
+            if !page.o("video").o("video_list").isEmpty { return true }
+            for block in page.a("blocks") where !block.o("video").o("video_list").isEmpty { return true }
+        }
+        return false
+    }
+
+    private static func pickVideo(_ list: JSON) -> URL? {
+        for k in ["V_HLSV4", "V_HLSV3_MOBILE", "V_HLSV3_WEB", "V_720P", "V_EXP7", "V_EXP6", "V_EXP5", "V_EXP4", "V_480P", "V_240P"] {
+            let s = list.o(k).s("url")
+            if !s.isEmpty, let u = URL(string: s) { return u }
+        }
+        for (_, v) in list { if let d = v as? JSON, !d.s("url").isEmpty, let u = URL(string: d.s("url")) { return u } }
+        return nil
+    }
+
+    /// The grid/cover picture, falling back to an idea pin's first-page image when the pin carries no
+    /// top-level images dict — so video and idea pins show a cover instead of being dropped or blank.
+    func gridImage(_ size: String) -> (URL, CGFloat)? {
+        if let r = image(size) { return r }
+        if let page = j.o("story_pin_data").a("pages").first {
+            if let r = Pin.pick(page.o("image").o("images"), size) { return r }
+            if let r = Pin.pick(page.o("images"), size) { return r }
         }
         return nil
     }
@@ -338,9 +370,9 @@ enum Pinterest {
             }
         }
         list.forEach(add)
-        // keep real pictures only; drop promoted pins (ads) and duplicates the related modules repeat
+        // keep anything with a cover (images, or an idea/video pin's fallback); drop ads and duplicates
         return out.filter { p in
-            p.image("236x") != nil && !p.isAd && seen.insert(p.id.isEmpty ? UUID().uuidString : p.id).inserted
+            p.gridImage("236x") != nil && !p.isAd && seen.insert(p.id.isEmpty ? UUID().uuidString : p.id).inserted
         }
     }
 

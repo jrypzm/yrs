@@ -474,7 +474,7 @@ final class PinHeader: UIView, GridHeader {
         return b
     }
 
-    private var ratio: CGFloat { min(max(pin.image("736x")?.1 ?? 1, 0.4), 2.0) }
+    private var ratio: CGFloat { min(max(pin.gridImage("736x")?.1 ?? 1, 0.4), 2.0) }
     private func picHeight(_ w: CGFloat) -> CGFloat { ceil((w - 24) * ratio) }
     private func stackHeight(_ w: CGFloat) -> CGFloat {
         stack.systemLayoutSizeFitting(CGSize(width: w - 32, height: 0), withHorizontalFittingPriority: .required, verticalFittingPriority: .fittingSizeLevel).height
@@ -499,7 +499,7 @@ final class PinHeader: UIView, GridHeader {
     private func loadPicture(_ w: CGFloat) {
         let px = (w - 24) * UIScreen.main.scale
         let key = Int(px)
-        guard key != shownPictureFor, let (u, _) = pin.image(px > 500 ? "736x" : "474x") else { return }
+        guard key != shownPictureFor, let (u, _) = pin.gridImage(px > 500 ? "736x" : "474x") else { return }
         shownPictureFor = key
         Images.load(u, px: px) { [weak self] img in self?.picture.image = img }
     }
