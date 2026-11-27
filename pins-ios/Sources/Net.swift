@@ -106,6 +106,31 @@ struct Pin {
         return nil
     }
 
+    /// The best directly-downloadable MP4 for saving to Photos — never the HLS playlist, never the
+    /// cover. Pinterest caps video at 720p, so V_720P is the target; otherwise the widest .mp4.
+    var videoFile: URL? {
+        if let u = Pin.bestMP4(j.o("videos").o("video_list")) { return u }
+        for page in j.o("story_pin_data").a("pages") {
+            if let u = Pin.bestMP4(page.o("video").o("video_list")) { return u }
+            for block in page.a("blocks") { if let u = Pin.bestMP4(block.o("video").o("video_list")) { return u } }
+        }
+        return nil
+    }
+
+    /// From a video_list: the clean 720p progressive MP4 (V_720P), else the widest .mp4 — and never an
+    /// HLS (.m3u8) entry, which can't be saved to Photos as a plain file.
+    private static func bestMP4(_ list: JSON) -> URL? {
+        var cands: [(url: URL, width: Int, is720: Bool)] = []
+        for (key, v) in list {
+            guard let d = v as? JSON else { continue }
+            let s = d.s("url"), k = key.uppercased()
+            guard !s.isEmpty, !k.contains("HLS"), !s.hasSuffix(".m3u8"), s.contains(".mp4"), let u = URL(string: s) else { continue }
+            cands.append((u, d.i("width"), k == "V_720P"))
+        }
+        if let p = cands.first(where: { $0.is720 }) { return p.url }
+        return cands.max { $0.width < $1.width }?.url
+    }
+
     /// Whether this is a video (for the ▶ badge in the grid), checked without building a URL.
     var isVideo: Bool {
         if !j.o("videos").o("video_list").isEmpty { return true }

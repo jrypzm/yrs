@@ -300,7 +300,7 @@ final class PinVC: GridVC {
         if Account.isSignedIn {
             a.addAction(UIAlertAction(title: "Save to board", style: .default) { [weak self] _ in self?.pickBoardAndSave() })
         }
-        a.addAction(UIAlertAction(title: "Save to Photos", style: .default) { [weak self] _ in self?.save() })
+        a.addAction(UIAlertAction(title: pin.isVideo ? "Save video to Photos" : "Save to Photos", style: .default) { [weak self] _ in self?.save() })
         if let l = pin.link {
             a.addAction(UIAlertAction(title: "Open link", style: .default) { _ in UIApplication.shared.open(l) })
         }
@@ -340,10 +340,12 @@ final class PinVC: GridVC {
         navigationController?.pushViewController(GridVC("@" + name) { bm, done in Pinterest.user(name, bookmark: bm, done: done) }, animated: true)
     }
 
-    /// The full-size picture goes to Photos; it's read, saved and let go of.
-    /// Saves the full-resolution original to Photos, keeping the original file bytes (no re-encoding).
-    /// Tries the best URL first, falling back if Pinterest 404s the /originals/ path.
+    private var dlObs: NSKeyValueObservation?
+
+    /// Save to Photos: a video pin saves the actual video (720p MP4), a photo pin saves the
+    /// full-resolution original. Video is detected by the video_list, not the unreliable is_video flag.
     private func save() {
+        if pin.isVideo { saveVideo(); return }
         var candidates = pin.saveCandidates
         guard !candidates.isEmpty else { tell("No picture to save."); return }
         func attempt() {
@@ -372,6 +374,71 @@ final class PinVC: GridVC {
                 DispatchQueue.main.async { self?.tell(ok ? "Saved to Photos — full quality." : "Couldn't save: \(err?.localizedDescription ?? "try again").") }
             }
         }
+    }
+
+    /// Downloads the video's MP4 and saves it to Photos as a video (not the thumbnail). Pinterest's
+    /// MP4 is a clean 720p copy, so this is one download with no conversion. HLS-only pins can't be saved.
+    private func saveVideo() {
+        guard let u = pin.videoFile else {
+            tell("This one's streaming-only — it can't be saved as a file. Tap the picture to watch it, or open it in Pinterest.")
+            return
+        }
+        let progress = UIAlertController(title: "Saving video", message: "Downloading… 0%", preferredStyle: .alert)
+        progress.addAction(UIAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in self?.dlObs = nil })
+        present(progress, animated: true)
+        let task = URLSession.shared.downloadTask(with: u) { [weak self] tmp, resp, err in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.dlObs = nil
+                guard self.presentedViewController === progress else { return }   // cancelled or dismissed
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let type = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type") ?? ""
+                progress.dismiss(animated: true) {
+                    guard let tmp = tmp, err == nil, (200 ..< 300).contains(code) else {
+                        self.tell("Couldn't download the video — \(err?.localizedDescription ?? "try again, or open it in Pinterest").")
+                        return
+                    }
+                    guard self.looksLikeVideo(tmp) || type.contains("video") else {
+                        self.tell("That didn't come back as a video. Try opening it in Pinterest.")
+                        return
+                    }
+                    let dest = FileManager.default.temporaryDirectory.appendingPathComponent("yrs-\(UUID().uuidString).mp4")
+                    try? FileManager.default.removeItem(at: dest)
+                    do { try FileManager.default.moveItem(at: tmp, to: dest) } catch { self.tell("Couldn't save the video."); return }
+                    self.writeVideoToPhotos(dest)
+                }
+            }
+        }
+        dlObs = task.progress.observe(\.fractionCompleted) { p, _ in
+            DispatchQueue.main.async { progress.message = "Downloading… \(Int(p.fractionCompleted * 100))%" }
+        }
+        task.resume()
+    }
+
+    private func writeVideoToPhotos(_ file: URL) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
+            guard status == .authorized || status == .limited else {
+                try? FileManager.default.removeItem(at: file)
+                DispatchQueue.main.async { self?.tell("Allow yrs. pins to add to Photos in Settings › Privacy › Photos.") }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                PHAssetCreationRequest.forAsset().addResource(with: .video, fileURL: file, options: nil)
+            } completionHandler: { ok, err in
+                try? FileManager.default.removeItem(at: file)
+                DispatchQueue.main.async { self?.tell(ok ? "Video saved to Photos." : "Couldn't save: \(err?.localizedDescription ?? "try again").") }
+            }
+        }
+    }
+
+    /// A quick check that the download is really an MP4/MOV (an 'ftyp' box near the start), so we never
+    /// hand Photos a stray HTML error page or playlist.
+    private func looksLikeVideo(_ url: URL) -> Bool {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? h.close() }
+        let b = [UInt8](h.readData(ofLength: 12))
+        guard b.count >= 8 else { return false }
+        return b[4] == 0x66 && b[5] == 0x74 && b[6] == 0x79 && b[7] == 0x70   // "ftyp"
     }
 
     private func tell(_ t: String) {
