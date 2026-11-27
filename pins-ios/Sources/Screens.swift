@@ -379,10 +379,35 @@ final class PinVC: GridVC {
     /// Downloads the video's MP4 and saves it to Photos as a video (not the thumbnail). Pinterest's
     /// MP4 is a clean 720p copy, so this is one download with no conversion. HLS-only pins can't be saved.
     private func saveVideo() {
-        guard let u = pin.videoFile else {
-            tell("This one's streaming-only — it can't be saved as a file. Tap the picture to watch it, or open it in Pinterest.")
-            return
-        }
+        if let u = pin.videoFile { downloadVideoFile(u); return }     // direct MP4 — fast path
+        if let hls = pin.hlsURL { assembleHLS(hls); return }          // streaming-only — build an MP4 from HLS
+        tell("This one can't be saved. Tap the picture to watch it, or open it in Pinterest.")
+    }
+
+    /// Streaming-only pins: assemble the HLS stream's fragments into one lossless MP4, then save it.
+    private func assembleHLS(_ hls: URL) {
+        let progress = UIAlertController(title: "Saving video", message: "Preparing… 0%", preferredStyle: .alert)
+        progress.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(progress, animated: true)
+        HLSVideo.assemble(hls, progress: { [weak progress] frac in
+            progress?.message = "Downloading… \(Int(frac * 100))%"
+        }, done: { [weak self] r in
+            guard let self = self, self.presentedViewController === progress else { return }   // cancelled
+            progress.dismiss(animated: true) {
+                switch r {
+                case .success(let file):
+                    if self.looksLikeVideo(file) { self.writeVideoToPhotos(file) }
+                    else { try? FileManager.default.removeItem(at: file); self.tell("Couldn't assemble the video. Try opening it in Pinterest.") }
+                case .failure(let code):
+                    if code == "ts" { self.tell("This video uses an older streaming format I can't rebuild on the phone. Tap the picture to watch it, or open it in Pinterest.") }
+                    else { self.tell("Couldn't download the video — try again, or open it in Pinterest.") }
+                }
+            }
+        })
+    }
+
+    /// A pin that has a direct MP4: download it and save (one file, fastest).
+    private func downloadVideoFile(_ u: URL) {
         let progress = UIAlertController(title: "Saving video", message: "Downloading… 0%", preferredStyle: .alert)
         progress.addAction(UIAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in self?.dlObs = nil })
         present(progress, animated: true)

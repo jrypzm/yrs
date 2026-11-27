@@ -131,6 +131,24 @@ struct Pin {
         return cands.max { $0.width < $1.width }?.url
     }
 
+    /// The HLS (.m3u8) master playlist — used only when there's no direct MP4, to assemble one.
+    var hlsURL: URL? {
+        func hls(_ list: JSON) -> URL? {
+            for k in ["V_HLSV4", "V_HLSV3_MOBILE", "V_HLSV3_WEB"] {
+                let s = list.o(k).s("url")
+                if !s.isEmpty, s.contains(".m3u8"), let u = URL(string: s) { return u }
+            }
+            for (_, v) in list { if let d = v as? JSON { let s = d.s("url"); if s.contains(".m3u8"), let u = URL(string: s) { return u } } }
+            return nil
+        }
+        if let u = hls(j.o("videos").o("video_list")) { return u }
+        for page in j.o("story_pin_data").a("pages") {
+            if let u = hls(page.o("video").o("video_list")) { return u }
+            for block in page.a("blocks") { if let u = hls(block.o("video").o("video_list")) { return u } }
+        }
+        return nil
+    }
+
     /// Whether this is a video (for the ▶ badge in the grid), checked without building a URL.
     var isVideo: Bool {
         if !j.o("videos").o("video_list").isEmpty { return true }
@@ -529,6 +547,123 @@ enum Pinterest {
             case .success: done(nil)
             case .failure(let e): done(e.description)
             }
+        }
+    }
+}
+
+// MARK: - HLS video → MP4 (for streaming-only pins)
+
+/// Turns a Pinterest HLS video into one playable MP4 on the phone — no re-encoding, no ffmpeg. Modern
+/// HLS (CMAF/fMP4) is an init segment plus media fragments that concatenate byte-for-byte into a valid
+/// MP4, so this is just: fetch the playlist, download the pieces, join them. Full, lossless quality.
+/// An old MPEG-TS stream (no init segment) can't be assembled this way → caller shows a fallback.
+enum HLSVideo {
+    private static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.urlCache = nil
+        c.httpMaximumConnectionsPerHost = 6     // fetch segments in parallel for speed
+        c.timeoutIntervalForRequest = 30
+        c.httpAdditionalHeaders = ["User-Agent": safariUA]
+        return URLSession(configuration: c)
+    }()
+
+    /// `progress` is 0…1 (on the main queue). `done` gets a local .mp4 file URL, or a short error code
+    /// ("ts" = MPEG-TS, can't assemble; else a generic failure).
+    static func assemble(_ master: URL, progress: @escaping (Double) -> Void, done: @escaping (Result<URL, String>) -> Void) {
+        text(master) { t in
+            guard let t = t else { fail("net", done); return }
+            if t.contains("#EXT-X-STREAM-INF") {                 // a master playlist → pick the best variant
+                guard let v = bestVariant(t, base: master) else { fail("net", done); return }
+                text(v) { mt in
+                    guard let mt = mt else { fail("net", done); return }
+                    build(mt, base: v, progress: progress, done: done)
+                }
+            } else {
+                build(t, base: master, progress: progress, done: done)
+            }
+        }
+    }
+
+    private static func fail(_ code: String, _ done: @escaping (Result<URL, String>) -> Void) {
+        DispatchQueue.main.async { done(.failure(code)) }
+    }
+
+    private static func text(_ u: URL, done: @escaping (String?) -> Void) {
+        session.dataTask(with: u) { d, _, _ in done(d.flatMap { String(data: $0, encoding: .utf8) }) }.resume()
+    }
+
+    /// The highest-resolution variant URI from a master playlist.
+    private static func bestVariant(_ master: String, base: URL) -> URL? {
+        let lines = master.components(separatedBy: .newlines)
+        var best: (score: Int, url: URL)?
+        var i = 0
+        while i < lines.count {
+            let line = lines[i].trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#EXT-X-STREAM-INF") {
+                var score = 0
+                if let r = line.range(of: "RESOLUTION=") {
+                    let dims = line[r.upperBound...].prefix { $0 != "," && !$0.isWhitespace }.split(separator: "x")
+                    if dims.count == 2, let w = Int(dims[0]), let h = Int(dims[1]) { score = w * h }
+                }
+                if score == 0, let r = line.range(of: "BANDWIDTH=") { score = Int(line[r.upperBound...].prefix { $0.isNumber }) ?? 0 }
+                var j = i + 1
+                while j < lines.count {
+                    let uri = lines[j].trimmingCharacters(in: .whitespaces)
+                    if !uri.isEmpty, !uri.hasPrefix("#") {
+                        if let url = URL(string: uri, relativeTo: base)?.absoluteURL, best == nil || score > best!.score { best = (score, url) }
+                        break
+                    }
+                    j += 1
+                }
+                i = j
+            }
+            i += 1
+        }
+        return best?.url
+    }
+
+    /// Parse a media playlist (init segment + fragments), download everything, and join in order.
+    private static func build(_ media: String, base: URL, progress: @escaping (Double) -> Void, done: @escaping (Result<URL, String>) -> Void) {
+        var initURL: URL?
+        var segs: [URL] = []
+        for raw in media.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#EXT-X-MAP:"), let r = line.range(of: "URI=\"") {
+                let uri = String(line[r.upperBound...].prefix { $0 != "\"" })
+                initURL = URL(string: uri, relativeTo: base)?.absoluteURL
+            } else if !line.isEmpty, !line.hasPrefix("#") {
+                if let u = URL(string: line, relativeTo: base)?.absoluteURL { segs.append(u) }
+            }
+        }
+        guard let initURL = initURL else { fail("ts", done); return }    // no init segment = MPEG-TS
+        guard !segs.isEmpty else { fail("net", done); return }
+
+        let all = [initURL] + segs
+        var parts = [Data?](repeating: nil, count: all.count)
+        var finished = 0
+        var failed = false
+        let lock = NSLock()
+        let group = DispatchGroup()
+        for (idx, u) in all.enumerated() {
+            group.enter()
+            session.dataTask(with: u) { d, resp, _ in
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                lock.lock()
+                if let d = d, !d.isEmpty, (200 ..< 300).contains(code) { parts[idx] = d } else { failed = true }
+                finished += 1
+                let frac = Double(finished) / Double(all.count)
+                lock.unlock()
+                DispatchQueue.main.async { progress(frac) }
+                group.leave()
+            }.resume()
+        }
+        group.notify(queue: .global(qos: .userInitiated)) {
+            if failed { fail("net", done); return }
+            var full = Data()
+            for p in parts { guard let p = p else { fail("net", done); return }; full.append(p) }
+            let out = FileManager.default.temporaryDirectory.appendingPathComponent("yrs-\(UUID().uuidString).mp4")
+            do { try full.write(to: out) } catch { fail("save", done); return }
+            DispatchQueue.main.async { done(.success(out)) }
         }
     }
 }
