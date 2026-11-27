@@ -585,7 +585,8 @@ enum HLSVideo {
     }
 
     private static func fail(_ code: String, _ done: @escaping (Result<URL, String>) -> Void) {
-        DispatchQueue.main.async { done(.failure(code)) }
+        let r = Result<URL, String>.failure(code)
+        DispatchQueue.main.async { done(r) }
     }
 
     private static func text(_ u: URL, done: @escaping (String?) -> Void) {

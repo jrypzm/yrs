@@ -389,9 +389,9 @@ final class PinVC: GridVC {
         let progress = UIAlertController(title: "Saving video", message: "Preparing… 0%", preferredStyle: .alert)
         progress.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         present(progress, animated: true)
-        HLSVideo.assemble(hls, progress: { [weak progress] frac in
+        HLSVideo.assemble(hls, progress: { [weak progress] (frac: Double) in
             progress?.message = "Downloading… \(Int(frac * 100))%"
-        }, done: { [weak self] r in
+        }, done: { [weak self] (r: Result<URL, String>) in
             guard let self = self, self.presentedViewController === progress else { return }   // cancelled
             progress.dismiss(animated: true) {
                 switch r {
