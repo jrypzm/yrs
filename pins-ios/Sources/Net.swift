@@ -105,6 +105,27 @@ struct Pin {
     }
 }
 
+/// One of your boards.
+struct Board {
+    let j: JSON
+    var id: String { j.s("id") }
+    var name: String { j.s("name") }
+    var pinCount: Int { (j["pin_count"] as? NSNumber)?.intValue ?? 0 }
+    var isSecret: Bool { (j["privacy"] as? String) == "secret" }
+    /// The board's cover picture, trying the shapes Pinterest uses across board objects.
+    var cover: URL? {
+        for key in ["image_cover_hd_url", "image_cover_url"] {
+            if let s = j[key] as? String, let u = URL(string: s), !s.isEmpty { return u }
+        }
+        let covers = j.o("cover_images")
+        for k in ["474x", "236x", "736x", "216x", "200x"] {
+            if let u = URL(string: covers.o(k).s("url")), !covers.o(k).s("url").isEmpty { return u }
+        }
+        if let first = (j["cover_pin"] as? JSON).flatMap({ Pin.pick($0.o("images"), "236x") }) { return first.0 }
+        return Pin.pick(j.o("images"), "236x")?.0
+    }
+}
+
 /// Your Pinterest login. The session cookie lives only in this app's own cookie store on the
 /// iPhone (where the sign-in page put it); it is attached to requests and never written to a file,
 /// a log, or sent anywhere but Pinterest.
@@ -112,6 +133,7 @@ enum Account {
     static let changed = Notification.Name("yrs.pins.account")
     private static let store = WKWebsiteDataStore.default()
     private static var appVersion: String?
+    private static var cachedUsername: String?
 
     static var isSignedIn: Bool { UserDefaults.standard.bool(forKey: "signedIn") }
 
@@ -132,6 +154,8 @@ enum Account {
             let pin = records.filter { $0.displayName.contains("pinterest") }
             store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: pin) {
                 UserDefaults.standard.set(false, forKey: "signedIn")
+                cachedUsername = nil
+                UserDefaults.standard.removeObject(forKey: "username")
                 NotificationCenter.default.post(name: Account.changed, object: nil)
             }
         }
@@ -161,6 +185,46 @@ enum Account {
             }
             DispatchQueue.main.async { done(appVersion) }
         }.resume()
+    }
+
+    /// Your username, needed for your boards and profile. Pinterest has no "who am I" endpoint, so we
+    /// read it once from your logged-in home page (where the viewer's own account fields appear) and cache it.
+    static func whoami(_ done: @escaping (String?) -> Void) {
+        if let u = cachedUsername, !u.isEmpty { done(u); return }
+        if let u = UserDefaults.standard.string(forKey: "username"), !u.isEmpty { cachedUsername = u; done(u); return }
+        guard isSignedIn else { done(nil); return }
+        auth { cookie, _, _ in
+            var req = URLRequest(url: URL(string: "https://www.pinterest.com/")!)
+            req.setValue(safariUA, forHTTPHeaderField: "User-Agent")
+            if !cookie.isEmpty { req.setValue(cookie, forHTTPHeaderField: "Cookie") }
+            URLSession.shared.dataTask(with: req) { d, _, _ in
+                let html = d.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                let name = parseUsername(html)
+                if let name = name { cachedUsername = name; UserDefaults.standard.set(name, forKey: "username") }
+                DispatchQueue.main.async { done(name) }
+            }.resume()
+        }
+    }
+
+    /// Finds the logged-in user's username in the home HTML: a "username" sitting next to an
+    /// account-only field (email / has_password / login_state) that only the viewer object carries.
+    private static func parseUsername(_ html: String) -> String? {
+        for m in ["\"has_password\"", "\"is_email_verified\"", "\"login_state\"", "\"email\""] {
+            var from = html.startIndex
+            while let mr = html.range(of: m, range: from ..< html.endIndex) {
+                let lo = html.index(mr.lowerBound, offsetBy: -1400, limitedBy: html.startIndex) ?? html.startIndex
+                let hi = html.index(mr.upperBound, offsetBy: 1400, limitedBy: html.endIndex) ?? html.endIndex
+                if let u = firstString(String(html[lo ..< hi]), key: "username"), u.count >= 3, u.count <= 40 { return u }
+                from = mr.upperBound
+            }
+        }
+        return nil
+    }
+
+    private static func firstString(_ s: String, key: String) -> String? {
+        guard let r = s.range(of: "\"\(key)\":\"") ?? s.range(of: "\"\(key)\": \"") else { return nil }
+        let v = String(s[r.upperBound...].prefix { $0 != "\"" })
+        return v.isEmpty ? nil : v
     }
 }
 
@@ -202,7 +266,9 @@ enum Pinterest {
                 r = .failure(.http(code))
             } else if let j = d.flatMap({ try? JSONSerialization.jsonObject(with: $0) }) as? JSON {
                 let rr = j.o("resource_response")
-                let bm = rr.s("bookmark")
+                // the next-page bookmark sits on resource_response, or on resource.options.bookmarks
+                var bm = rr.s("bookmark")
+                if bm.isEmpty { bm = (j.o("resource").o("options")["bookmarks"] as? [Any])?.first as? String ?? "" }
                 r = .success((rr["data"], bm.isEmpty || bm == "-end-" ? nil : bm))
             } else {
                 r = .failure(.bad)
@@ -227,14 +293,65 @@ enum Pinterest {
     static func pins(_ data: Any?) -> [Pin] {
         let list: [JSON] = (data as? [JSON]) ?? ((data as? JSON)?.a("results") ?? [])
         var out: [Pin] = []
-        for x in list {
+        var seen = Set<String>()
+        func add(_ x: JSON) {
             switch x.s("type") {
             case "pin": out.append(Pin(j: x))
-            case "story": out += x.a("objects").filter { $0.s("type") == "pin" }.map { Pin(j: $0) }
-            default: if x["images"] != nil { out.append(Pin(j: x)) }
+            case "story": x.a("objects").forEach(add)                   // a story module groups pins
+            default:
+                if x["images"] != nil { out.append(Pin(j: x)) }        // a pin with no explicit type
+                else { x.a("objects").forEach(add) }                   // a related-pins module wraps them in objects
             }
         }
-        return out.filter { $0.image("236x") != nil }
+        list.forEach(add)
+        // keep only real pictures, and drop duplicates the related modules can repeat
+        return out.filter { $0.image("236x") != nil && seen.insert($0.id.isEmpty ? UUID().uuidString : $0.id).inserted }
+    }
+
+    /// A POST to one of the website's `create` endpoints (saving a pin, making a board). Needs sign-in.
+    static func post(_ resource: String, source: String, options: JSON, done: @escaping (Result<Any?, APIError>) -> Void) {
+        let body: JSON = ["options": options, "context": [:] as JSON]
+        guard let data = try? JSONSerialization.data(withJSONObject: body), let ds = String(data: data, encoding: .utf8),
+              let u = URL(string: "https://www.pinterest.com/resource/\(resource)/create/") else { done(.failure(.bad)); return }
+        var form = URLComponents()
+        form.queryItems = [URLQueryItem(name: "source_url", value: source), URLQueryItem(name: "data", value: ds)]
+        let bodyData = (form.percentEncodedQuery ?? "").data(using: .utf8)
+        Account.auth { cookie, csrf, version in
+            var req = URLRequest(url: u)
+            req.httpMethod = "POST"
+            req.httpBody = bodyData
+            req.setValue(safariUA, forHTTPHeaderField: "User-Agent")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            req.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+            req.setValue("https://www.pinterest.com/", forHTTPHeaderField: "Referer")
+            req.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+            if !cookie.isEmpty { req.setValue(cookie, forHTTPHeaderField: "Cookie") }
+            if !csrf.isEmpty { req.setValue(csrf, forHTTPHeaderField: "X-CSRFToken") }
+            if let v = version { req.setValue(v, forHTTPHeaderField: "X-APP-VERSION") }
+            session.dataTask(with: req) { d, resp, err in
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let r: Result<Any?, APIError>
+                if let err = err {
+                    r = .failure(.offline((err as NSError).code == NSURLErrorNotConnectedToInternet ? "No internet connection." : err.localizedDescription))
+                } else if code == 401 || code == 403 {
+                    r = .failure(.offline("Pinterest didn't accept it — try signing in again."))
+                } else if !(200 ..< 300).contains(code) {
+                    r = .failure(.http(code))
+                } else if let j = (d.flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? JSON {
+                    let rr = j.o("resource_response")
+                    if let e = rr["error"] as? JSON, !e.isEmpty {
+                        r = .failure(.offline(e.s("message").isEmpty ? "Pinterest wouldn't do that." : e.s("message")))
+                    } else if rr.s("status") == "error" || rr.s("status") == "failure" {
+                        r = .failure(.offline("Pinterest wouldn't do that."))
+                    } else {
+                        r = .success(rr["data"])
+                    }
+                } else {
+                    r = .failure(.bad)
+                }
+                DispatchQueue.main.async { done(r) }
+            }.resume()
+        }
     }
 
     /// Your own home feed (needs sign-in).
@@ -259,6 +376,66 @@ enum Pinterest {
         if let b = bookmark { o["bookmarks"] = [b] }
         get("UserActivityPinsResource", source: "/\(name)/_created/", handler: "[username]/_created", options: o, auth: Account.isSignedIn) { r in
             done(r.map { (pins($0.0), $0.1) })
+        }
+    }
+
+    /// "More like this" — Pinterest's own related feed for a pin (the real recommendations, not a
+    /// text search). Works off the pin's id; the caller falls back to a search if this comes back empty.
+    static func related(pinID: String, bookmark: String?, done: @escaping (Result<([Pin], String?), APIError>) -> Void) {
+        guard !pinID.isEmpty else { done(.success(([], nil))); return }
+        var o: JSON = ["pin_id": pinID, "page_size": 25, "add_vase": true, "pins_only": false]
+        if let b = bookmark { o["bookmarks"] = [b] }
+        get("RelatedModulesResource", source: "/pin/\(pinID)/", handler: "PinCloseup", options: o, auth: Account.isSignedIn) { r in
+            done(r.map { (pins($0.0), $0.1) })
+        }
+    }
+
+    /// Your boards (needs sign-in). Resolves your username first, then asks for the board list.
+    static func boards(bookmark: String?, done: @escaping (Result<([Board], String?), APIError>) -> Void) {
+        Account.whoami { name in
+            guard let name = name, !name.isEmpty else {
+                done(.failure(.offline("Couldn't find your Pinterest profile. Pull down to retry, or sign in again."))); return
+            }
+            var o: JSON = ["username": name, "field_set_key": "profile_grid_item", "privacy_filter": "all",
+                           "sort": "custom", "page_size": 50, "include_archived": true]
+            if let b = bookmark { o["bookmarks"] = [b] }
+            get("BoardsResource", source: "/\(name)/boards/", handler: "[username]/boards", options: o, auth: true) { r in
+                done(r.map { d in ((d.0 as? [JSON] ?? []).filter { !$0.s("name").isEmpty }.map { Board(j: $0) }, d.1) })
+            }
+        }
+    }
+
+    /// The pins in one of your boards.
+    static func boardFeed(boardID: String, bookmark: String?, done: @escaping (Result<([Pin], String?), APIError>) -> Void) {
+        var o: JSON = ["board_id": boardID, "field_set_key": "react_grid_pin", "filter_section_pins": true, "page_size": 25]
+        if let b = bookmark { o["bookmarks"] = [b] }
+        get("BoardFeedResource", source: "/", handler: "[username]/[slug]", options: o, auth: true) { r in
+            done(r.map { (pins($0.0), $0.1) })
+        }
+    }
+
+    /// Your own pins (everything you've saved and created).
+    static func myPins(bookmark: String?, done: @escaping (Result<([Pin], String?), APIError>) -> Void) {
+        Account.whoami { name in
+            guard let name = name, !name.isEmpty else {
+                done(.failure(.offline("Couldn't find your Pinterest profile. Pull down to retry, or sign in again."))); return
+            }
+            var o: JSON = ["username": name, "field_set_key": "grid_item", "is_own_profile_pins": true, "page_size": 25]
+            if let b = bookmark { o["bookmarks"] = [b] }
+            get("UserPinsResource", source: "/\(name)/_saved/", handler: "[username]", options: o, auth: true) { r in
+                done(r.map { (pins($0.0), $0.1) })
+            }
+        }
+    }
+
+    /// Save (repin) a pin onto one of your boards. Succeeds silently; `done(nil)` means it went through.
+    static func save(pinID: String, boardID: String, done: @escaping (String?) -> Void) {
+        guard !pinID.isEmpty, !boardID.isEmpty else { done("Missing the pin or board."); return }
+        post("RepinResource", source: "/pin/\(pinID)/", options: ["pin_id": pinID, "board_id": boardID, "is_buyable_pin": false]) { r in
+            switch r {
+            case .success: done(nil)
+            case .failure(let e): done(e.description)
+            }
         }
     }
 }

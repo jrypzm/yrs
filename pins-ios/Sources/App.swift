@@ -7,7 +7,6 @@ import UIKit
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
-    private let nav = UINavigationController()
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         let bar = UINavigationBarAppearance()
@@ -18,29 +17,36 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         UINavigationBar.appearance().standardAppearance = bar
         UINavigationBar.appearance().scrollEdgeAppearance = bar
 
-        nav.setViewControllers([Screen.root()], animated: false)
         let w = UIWindow(frame: UIScreen.main.bounds)
         w.backgroundColor = .black
         w.overrideUserInterfaceStyle = .dark
         w.tintColor = .white
-        w.rootViewController = nav
+        w.rootViewController = Screen.root()
         w.makeKeyAndVisible()
         window = w
-        // signing in or out swaps the main screen between the home feed and the welcome screen
+        // signing in or out swaps the whole root between the tab bar and the welcome screen
         NotificationCenter.default.addObserver(self, selector: #selector(accountChanged), name: Account.changed, object: nil)
         // the sign-in cookies may already be there from last time
         Account.refresh()
-        demo(nav)
+        demo()
         return true
     }
 
     @objc private func accountChanged() {
-        nav.setViewControllers([Screen.root()], animated: false)
+        guard let w = window else { return }
+        let root = Screen.root()
+        UIView.transition(with: w, duration: 0.25, options: .transitionCrossDissolve) { w.rootViewController = root }
+    }
+
+    /// The navigation stack currently on screen (the selected tab, or the welcome stack).
+    private func topNav() -> UINavigationController? {
+        if let tabs = window?.rootViewController as? UITabBarController { return tabs.selectedViewController as? UINavigationController }
+        return window?.rootViewController as? UINavigationController
     }
 
     /// Only for the screenshots taken with each build: `-demo search:cats` or `-demo pin:cats`.
-    private func demo(_ nav: UINavigationController) {
-        guard let d = UserDefaults.standard.string(forKey: "demo"), let colon = d.firstIndex(of: ":") else { return }
+    private func demo() {
+        guard let d = UserDefaults.standard.string(forKey: "demo"), let colon = d.firstIndex(of: ":"), let nav = topNav() else { return }
         let kind = d[..<colon], arg = String(d[d.index(after: colon)...])
         switch kind {
         case "search": nav.pushViewController(Screen.search(arg), animated: false)

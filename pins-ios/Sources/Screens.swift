@@ -8,13 +8,40 @@ import WebKit
 
 enum Screen {
     static func search(_ q: String) -> GridVC {
-        let g = GridVC(q) { bm, done in Pinterest.search(q, bookmark: bm, done: done) }
-        return g
+        GridVC(q) { bm, done in Pinterest.search(q, bookmark: bm, done: done) }
     }
 
-    /// The app's root, chosen by whether you're signed in: your home feed, or a welcome screen.
+    /// The app's root: signed in, a Pinterest-style tab bar (Home · Search · Boards · You); signed
+    /// out, the welcome screen.
     static func root() -> UIViewController {
-        Account.isSignedIn ? HomeFeedVC() : WelcomeVC()
+        Account.isSignedIn ? MainTabs() : UINavigationController(rootViewController: WelcomeVC())
+    }
+}
+
+/// The bottom tab bar — Home · Search · Boards · You — each its own navigation stack.
+final class MainTabs: UITabBarController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        viewControllers = [
+            tab(HomeFeedVC(), "Home", "house.fill"),
+            tab(SearchVC(), "Search", "magnifyingglass"),
+            tab(BoardsVC(), "Boards", "square.grid.2x2.fill"),
+            tab(ProfileVC(), "You", "person.crop.circle"),
+        ]
+        let a = UITabBarAppearance()
+        a.configureWithOpaqueBackground()
+        a.backgroundColor = .black
+        tabBar.standardAppearance = a
+        if #available(iOS 15.0, *) { tabBar.scrollEdgeAppearance = a }
+        tabBar.tintColor = Style.accent
+        tabBar.unselectedItemTintColor = Style.dim
+    }
+
+    private func tab(_ vc: UIViewController, _ title: String, _ icon: String) -> UINavigationController {
+        vc.title = title
+        let n = UINavigationController(rootViewController: vc)
+        n.tabBarItem = UITabBarItem(title: title, image: UIImage(systemName: icon), tag: 0)
+        return n
     }
 }
 
@@ -25,20 +52,27 @@ final class HomeFeedVC: GridVC {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+}
+
+/// The "You" tab: your own pins, with a Sign-out in the corner.
+final class ProfileVC: GridVC {
+    init() {
+        super.init("You") { bm, done in Pinterest.myPins(bookmark: bm, done: done) }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        navigationItem.rightBarButtonItem = UIBarButtonItem(barButtonSystemItem: .search, target: self, action: #selector(search))
-        navigationItem.leftBarButtonItem = UIBarButtonItem(title: "Account", style: .plain, target: self, action: #selector(account))
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Account", style: .plain, target: self, action: #selector(account))
+        Account.whoami { [weak self] name in if let n = name, !n.isEmpty { self?.title = "@" + n } }
     }
-
-    @objc private func search() { navigationController?.pushViewController(SearchVC(), animated: true) }
 
     @objc private func account() {
         let a = UIAlertController(title: "Account", message: nil, preferredStyle: .actionSheet)
         a.addAction(UIAlertAction(title: "Sign out", style: .destructive) { _ in Account.signOut() })
         a.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        a.popoverPresentationController?.barButtonItem = navigationItem.leftBarButtonItem
+        a.popoverPresentationController?.barButtonItem = navigationItem.rightBarButtonItem
         present(a, animated: true)
     }
 }
@@ -208,18 +242,40 @@ final class PinVC: GridVC {
     init(_ p: Pin) {
         pin = p
         head = PinHeader(p)
-        // similar pins come from a search of the pin's words
+        // "More like this" is Pinterest's own related feed. If that comes back empty (e.g. a pin whose
+        // id is one of the new search tokens Pinterest won't resolve) we fall back to a word search, so
+        // it's never worse than before and genuinely right when related works.
         let query = !p.title.isEmpty ? p.title : (!p.board.isEmpty ? p.board : p.about)
         super.init(p.user.isEmpty ? "Pin" : p.user) { bm, done in
-            if query.trimmingCharacters(in: .whitespaces).isEmpty { done(.success(([], nil))); return }
-            Pinterest.search(query, bookmark: bm) { r in
-                // drop the pin itself if it comes back
-                done(r.map { (pins, next) in (pins.filter { $0.id != p.id }, next) })
-            }
+            PinVC.moreLikeThis(p, query: query, bookmark: bm, done: done)
         }
         headerView = head
         head.onPicture = { [weak self] in self?.openPicture() }
         head.onUser = { [weak self] in self?.openUser() }
+    }
+
+    /// Related pins for the grid. The source is tagged into the bookmark ("R:" related, "S:" search)
+    /// so paging stays on whichever one answered; search is used only when related's first page is empty.
+    private static func moreLikeThis(_ p: Pin, query: String, bookmark: String?, done: @escaping (Result<([Pin], String?), APIError>) -> Void) {
+        func tag(_ list: [Pin], _ next: String?, _ t: String) -> ([Pin], String?) {
+            (list.filter { $0.id != p.id }, next.map { t + $0 })
+        }
+        func search(_ bm: String?) {
+            if query.trimmingCharacters(in: .whitespaces).isEmpty { done(.success(([], nil))); return }
+            Pinterest.search(query, bookmark: bm) { r in done(r.map { tag($0.0, $0.1, "S:") }) }
+        }
+        if let bm = bookmark {
+            if bm.hasPrefix("S:") { search(String(bm.dropFirst(2))) }
+            else { Pinterest.related(pinID: p.id, bookmark: bm.hasPrefix("R:") ? String(bm.dropFirst(2)) : bm) { r in done(r.map { tag($0.0, $0.1, "R:") }) } }
+            return
+        }
+        Pinterest.related(pinID: p.id, bookmark: nil) { r in
+            if case .success(let (list, next)) = r, !list.filter({ $0.id != p.id }).isEmpty {
+                done(.success(tag(list, next, "R:")))
+            } else {
+                search(nil)   // related had nothing (or errored) — fall back to a word search
+            }
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -240,6 +296,9 @@ final class PinVC: GridVC {
     /// The ⋯ menu: everything you can do with the pin, kept out of the way.
     @objc private func menu() {
         let a = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
+        if Account.isSignedIn {
+            a.addAction(UIAlertAction(title: "Save to board", style: .default) { [weak self] _ in self?.pickBoardAndSave() })
+        }
         a.addAction(UIAlertAction(title: "Save to Photos", style: .default) { [weak self] _ in self?.save() })
         if let l = pin.link {
             a.addAction(UIAlertAction(title: "Open link", style: .default) { _ in UIApplication.shared.open(l) })
@@ -248,6 +307,17 @@ final class PinVC: GridVC {
         a.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         a.popoverPresentationController?.barButtonItem = navigationItem.rightBarButtonItem
         present(a, animated: true)
+    }
+
+    /// Pick one of your boards, then repin onto it.
+    private func pickBoardAndSave() {
+        let picker = BoardPickerVC { [weak self] board in
+            guard let self = self, let board = board else { return }
+            Pinterest.save(pinID: self.pin.id, boardID: board.id) { [weak self] err in
+                self?.tell(err == nil ? "Saved to \(board.name)." : "Couldn't save — \(err!)")
+            }
+        }
+        present(UINavigationController(rootViewController: picker), animated: true)
     }
 
     private func openPicture() {
@@ -420,6 +490,235 @@ final class PinHeader: UIView, GridHeader {
     @objc private func tapLink() { onLink?() }
     @objc private func tapSave() { onSave?() }
     @objc private func tapPinterest() { onPinterest?() }
+}
+
+// MARK: - boards
+
+/// The "Boards" tab: a two-column grid of your boards, each a cover with its name and pin count.
+final class BoardsVC: UICollectionViewController, UICollectionViewDelegateFlowLayout {
+    private var boards: [Board] = []
+    private var bookmark: String?
+    private var more = true
+    private var loading = false
+    private var generation = 0
+    private let note = UILabel()
+
+    init() {
+        let l = UICollectionViewFlowLayout()
+        l.minimumInteritemSpacing = 10
+        l.minimumLineSpacing = 16
+        l.sectionInset = UIEdgeInsets(top: 12, left: 12, bottom: 24, right: 12)
+        super.init(collectionViewLayout: l)
+        title = "Boards"
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        collectionView.backgroundColor = .black
+        collectionView.indicatorStyle = .white
+        collectionView.alwaysBounceVertical = true
+        collectionView.register(BoardCard.self, forCellWithReuseIdentifier: "b")
+        note.textColor = Style.dim
+        note.font = .systemFont(ofSize: 15)
+        note.numberOfLines = 0
+        note.textAlignment = .center
+        collectionView.backgroundView = note
+        let r = UIRefreshControl()
+        r.tintColor = .gray
+        r.addTarget(self, action: #selector(reload), for: .valueChanged)
+        collectionView.refreshControl = r
+        reload()
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        if boards.isEmpty, !loading { reload() }
+    }
+
+    @objc private func reload() {
+        generation += 1
+        bookmark = nil
+        more = true
+        loading = false
+        load(first: true)
+    }
+
+    private func load(first: Bool) {
+        guard more, !loading else { return }
+        loading = true
+        if boards.isEmpty { note.text = "Loading…" }
+        let gen = generation
+        Pinterest.boards(bookmark: first ? nil : bookmark) { [weak self] r in
+            guard let s = self, gen == s.generation else { return }
+            s.loading = false
+            s.collectionView.refreshControl?.endRefreshing()
+            switch r {
+            case .success(let (bs, bm)):
+                if first { s.boards = bs } else { s.boards += bs }
+                s.bookmark = bm
+                s.more = bm != nil && !bs.isEmpty
+                s.note.text = s.boards.isEmpty ? "No boards yet." : nil
+                s.collectionView.reloadData()
+            case .failure(let e):
+                if first { s.boards = []; s.collectionView.reloadData() }
+                s.more = false
+                s.note.text = s.boards.isEmpty ? e.description : nil
+            }
+        }
+    }
+
+    func collectionView(_ cv: UICollectionView, layout: UICollectionViewLayout, sizeForItemAt ip: IndexPath) -> CGSize {
+        let w = floor((cv.bounds.width - 12 * 2 - 10) / 2)
+        return CGSize(width: w, height: w + 46)   // square cover + name + count
+    }
+
+    override func collectionView(_ cv: UICollectionView, numberOfItemsInSection section: Int) -> Int { boards.count }
+
+    override func collectionView(_ cv: UICollectionView, cellForItemAt ip: IndexPath) -> UICollectionViewCell {
+        let c = cv.dequeueReusableCell(withReuseIdentifier: "b", for: ip) as! BoardCard
+        c.show(boards[ip.item])
+        return c
+    }
+
+    override func collectionView(_ cv: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt ip: IndexPath) {
+        if more, !loading, ip.item >= boards.count - 4 { load(first: false) }
+    }
+
+    override func collectionView(_ cv: UICollectionView, didSelectItemAt ip: IndexPath) {
+        let b = boards[ip.item]
+        navigationController?.pushViewController(GridVC(b.name) { bm, done in Pinterest.boardFeed(boardID: b.id, bookmark: bm, done: done) }, animated: true)
+    }
+
+    override func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        Images.forget()
+    }
+}
+
+/// One board: a rounded cover picture with its name and pin count underneath.
+final class BoardCard: UICollectionViewCell {
+    private let cover = UIImageView()
+    private let name = UILabel()
+    private let count = UILabel()
+    private var url: URL?
+    private var task: URLSessionDataTask?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        cover.contentMode = .scaleAspectFill
+        cover.clipsToBounds = true
+        cover.layer.cornerRadius = 16
+        cover.backgroundColor = Style.card
+        contentView.addSubview(cover)
+        name.font = .systemFont(ofSize: 14, weight: .semibold)
+        name.textColor = .white
+        name.numberOfLines = 1
+        count.font = .systemFont(ofSize: 12)
+        count.textColor = Style.dim
+        contentView.addSubview(name)
+        contentView.addSubview(count)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let w = contentView.bounds.width
+        cover.frame = CGRect(x: 0, y: 0, width: w, height: w)
+        name.frame = CGRect(x: 2, y: w + 5, width: w - 4, height: 18)
+        count.frame = CGRect(x: 2, y: w + 24, width: w - 4, height: 16)
+    }
+
+    func show(_ b: Board) {
+        task?.cancel()
+        cover.image = nil
+        name.text = (b.isSecret ? "🔒 " : "") + b.name
+        count.text = b.pinCount == 1 ? "1 pin" : "\(b.pinCount) pins"
+        guard let u = b.cover else { url = nil; return }
+        url = u
+        task = Images.thumb(u, side: 220) { [weak self] img in
+            guard let s = self, s.url == u else { return }
+            s.cover.image = img
+        }
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        task?.cancel()
+        task = nil
+        url = nil
+        cover.image = nil
+    }
+}
+
+/// A modal list of your boards for choosing where to save a pin.
+final class BoardPickerVC: UITableViewController {
+    private var boards: [Board] = []
+    private var note = "Loading…"
+    private let onPick: (Board?) -> Void
+
+    init(onPick: @escaping (Board?) -> Void) {
+        self.onPick = onPick
+        super.init(style: .plain)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "Save to…"
+        view.backgroundColor = .black
+        tableView.backgroundColor = .black
+        tableView.separatorColor = Style.faint
+        tableView.register(UITableViewCell.self, forCellReuseIdentifier: "b")
+        navigationItem.leftBarButtonItem = UIBarButtonItem(barButtonSystemItem: .cancel, target: self, action: #selector(cancel))
+        load()
+    }
+
+    private func load() {
+        Pinterest.boards(bookmark: nil) { [weak self] r in
+            guard let s = self else { return }
+            switch r {
+            case .success(let (bs, _)): s.boards = bs; s.note = bs.isEmpty ? "No boards yet. Make one in Pinterest first." : ""
+            case .failure(let e): s.note = e.description
+            }
+            s.tableView.reloadData()
+        }
+    }
+
+    @objc private func cancel() { onPick(nil); dismiss(animated: true) }
+
+    override func tableView(_ t: UITableView, numberOfRowsInSection s: Int) -> Int { boards.isEmpty ? 1 : boards.count }
+
+    override func tableView(_ t: UITableView, cellForRowAt ip: IndexPath) -> UITableViewCell {
+        let c = t.dequeueReusableCell(withIdentifier: "b", for: ip)
+        c.backgroundColor = .black
+        var cfg = c.defaultContentConfiguration()
+        if boards.isEmpty {
+            cfg.text = note
+            cfg.textProperties.color = Style.dim
+            c.selectionStyle = .none
+        } else {
+            let b = boards[ip.item]
+            cfg.text = (b.isSecret ? "🔒 " : "") + b.name
+            cfg.secondaryText = b.pinCount == 1 ? "1 pin" : "\(b.pinCount) pins"
+            cfg.textProperties.color = .white
+            cfg.secondaryTextProperties.color = Style.dim
+            c.selectionStyle = .default
+        }
+        c.contentConfiguration = cfg
+        return c
+    }
+
+    override func tableView(_ t: UITableView, didSelectRowAt ip: IndexPath) {
+        t.deselectRow(at: ip, animated: true)
+        guard boards.indices.contains(ip.item) else { return }
+        let b = boards[ip.item]
+        onPick(b)
+        dismiss(animated: true)
+    }
 }
 
 // MARK: - pictures, full screen
