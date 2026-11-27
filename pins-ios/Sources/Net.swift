@@ -569,7 +569,7 @@ enum HLSVideo {
 
     /// `progress` is 0…1 (on the main queue). `done` gets a local .mp4 file URL, or a short error code
     /// ("ts" = MPEG-TS, can't assemble; else a generic failure).
-    static func assemble(_ master: URL, progress: @escaping (Double) -> Void, done: @escaping (Result<URL, String>) -> Void) {
+    static func assemble(_ master: URL, progress: @escaping (Double) -> Void, done: @escaping (URL?, String?) -> Void) {
         text(master) { t in
             guard let t = t else { fail("net", done); return }
             if t.contains("#EXT-X-STREAM-INF") {                 // a master playlist → pick the best variant
@@ -584,9 +584,8 @@ enum HLSVideo {
         }
     }
 
-    private static func fail(_ code: String, _ done: @escaping (Result<URL, String>) -> Void) {
-        let r = Result<URL, String>.failure(code)
-        DispatchQueue.main.async { done(r) }
+    private static func fail(_ code: String, _ done: @escaping (URL?, String?) -> Void) {
+        DispatchQueue.main.async { done(nil, code) }
     }
 
     private static func text(_ u: URL, done: @escaping (String?) -> Void) {
@@ -624,7 +623,7 @@ enum HLSVideo {
     }
 
     /// Parse a media playlist (init segment + fragments), download everything, and join in order.
-    private static func build(_ media: String, base: URL, progress: @escaping (Double) -> Void, done: @escaping (Result<URL, String>) -> Void) {
+    private static func build(_ media: String, base: URL, progress: @escaping (Double) -> Void, done: @escaping (URL?, String?) -> Void) {
         var initURL: URL?
         var segs: [URL] = []
         for raw in media.components(separatedBy: .newlines) {
@@ -664,7 +663,7 @@ enum HLSVideo {
             for p in parts { guard let p = p else { fail("net", done); return }; full.append(p) }
             let out = FileManager.default.temporaryDirectory.appendingPathComponent("yrs-\(UUID().uuidString).mp4")
             do { try full.write(to: out) } catch { fail("save", done); return }
-            DispatchQueue.main.async { done(.success(out)) }
+            DispatchQueue.main.async { done(out, nil) }
         }
     }
 }

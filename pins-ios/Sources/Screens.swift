@@ -391,16 +391,16 @@ final class PinVC: GridVC {
         present(progress, animated: true)
         HLSVideo.assemble(hls, progress: { [weak progress] (frac: Double) in
             progress?.message = "Downloading… \(Int(frac * 100))%"
-        }, done: { [weak self] (r: Result<URL, String>) in
+        }, done: { [weak self] (file: URL?, code: String?) in
             guard let self = self, self.presentedViewController === progress else { return }   // cancelled
             progress.dismiss(animated: true) {
-                switch r {
-                case .success(let file):
+                if let file = file {
                     if self.looksLikeVideo(file) { self.writeVideoToPhotos(file) }
                     else { try? FileManager.default.removeItem(at: file); self.tell("Couldn't assemble the video. Try opening it in Pinterest.") }
-                case .failure(let code):
-                    if code == "ts" { self.tell("This video uses an older streaming format I can't rebuild on the phone. Tap the picture to watch it, or open it in Pinterest.") }
-                    else { self.tell("Couldn't download the video — try again, or open it in Pinterest.") }
+                } else if code == "ts" {
+                    self.tell("This video uses an older streaming format I can't rebuild on the phone. Tap the picture to watch it, or open it in Pinterest.")
+                } else {
+                    self.tell("Couldn't download the video — try again, or open it in Pinterest.")
                 }
             }
         })
