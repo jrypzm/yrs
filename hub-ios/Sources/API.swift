@@ -1,9 +1,9 @@
-// Talking to GitHub: one small HTTP client, no cache kept in memory or on disk.
-// Signed out it reads public GitHub (60 requests an hour); with a token, 5,000 an hour,
-// plus your notifications, repositories, stars and pull requests.
+// Talking to GitHub, signed out — public GitHub only. GitHub's no-login limit is 60 requests an hour
+// (per network IP) for the core API, plus 10 searches a minute. Replies are cached on disk for a short
+// while, so re-opening a repo, a README or a release list costs nothing and the scarce hourly budget
+// stretches much further. No token, no account, no tracking.
 
 import Foundation
-import Security
 
 enum APIError: Error, CustomStringConvertible {
     case http(Int, String)
@@ -12,8 +12,9 @@ enum APIError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .http(401, _): return "GitHub didn't accept the token. Sign in again."
-        case .http(403, let m) where m.lowercased().contains("rate limit"): return "GitHub's hourly limit is used up. Sign in for a higher one, or wait a little."
+        case .http(403, let m) where m.lowercased().contains("rate limit") || m.isEmpty:
+            return "GitHub's no-login limit (60/hour, shared across your network) is used up. Try again \(RateLimit.resetText)."
+        case .http(429, _): return "GitHub is asking you to slow down. Wait a minute and pull down to retry."
         case .http(404, _): return "Not found, or private."
         case .http(let c, let m): return m.isEmpty ? "GitHub answered \(c)." : m
         case .offline(let m): return m
@@ -22,27 +23,41 @@ enum APIError: Error, CustomStringConvertible {
     }
 }
 
+/// What's left of the no-login hourly budget, read from GitHub's reply headers.
+enum RateLimit {
+    static var coreRemaining: Int?
+    static var coreReset: Date?
+    static var searchRemaining: Int?
+
+    static func capture(_ h: HTTPURLResponse) {
+        guard let remS = h.value(forHTTPHeaderField: "x-ratelimit-remaining"), let rem = Int(remS) else { return }
+        let reset = h.value(forHTTPHeaderField: "x-ratelimit-reset").flatMap { Double($0) }.map { Date(timeIntervalSince1970: $0) }
+        if (h.value(forHTTPHeaderField: "x-ratelimit-resource") ?? "core") == "search" { searchRemaining = rem }
+        else { coreRemaining = rem; coreReset = reset }
+    }
+
+    /// "in about 12 min", for the friendly limit message.
+    static var resetText: String {
+        guard let d = coreReset else { return "in a little while" }
+        let s = Int(d.timeIntervalSinceNow)
+        if s <= 0 { return "now" }
+        return s < 90 ? "in under a minute" : "in about \(Int(round(Double(s) / 60))) min"
+    }
+}
+
 final class API {
     static let shared = API()
     static let base = URL(string: "https://api.github.com")!
-    static let signedIn = Notification.Name("yrs.hub.signin")
 
     private let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         c.urlCache = nil
         c.requestCachePolicy = .reloadIgnoringLocalCacheData
-        c.httpMaximumConnectionsPerHost = 2
+        c.httpMaximumConnectionsPerHost = 2    // serial-ish, to stay clear of secondary limits
         c.timeoutIntervalForRequest = 20
         c.httpAdditionalHeaders = ["User-Agent": "yrs-hub", "X-GitHub-Api-Version": "2022-11-28"]
         return URLSession(configuration: c)
     }()
-
-    private(set) var token: String? = Keychain.read()
-    /// The signed-in user's login, once known.
-    private(set) var me: String?
-    var isSignedIn: Bool { token != nil }
-    /// Used only for the screenshots taken with each build (more requests an hour); never saved.
-    var lentToken: String?
 
     // MARK: requests
 
@@ -57,9 +72,9 @@ final class API {
         return c.url ?? u
     }
 
-    /// GET some JSON; the reply on the main queue.
-    func json(_ path: String, _ query: [String: String] = [:], done: @escaping (Result<Any, APIError>) -> Void) {
-        send("GET", url(path, query), accept: "application/vnd.github+json") { r in
+    /// GET some JSON; `cache` seconds serves a fresh on-disk copy without spending the hourly budget.
+    func json(_ path: String, _ query: [String: String] = [:], cache: TimeInterval = 0, done: @escaping (Result<Any, APIError>) -> Void) {
+        send(url(path, query), accept: "application/vnd.github+json", cache: cache) { r in
             done(r.flatMap { data in
                 guard let j = try? JSONSerialization.jsonObject(with: data) else { return .failure(.bad) }
                 return .success(j)
@@ -68,8 +83,8 @@ final class API {
     }
 
     /// GET a file or README as plain text (raw); nil text for a binary file.
-    func raw(_ path: String, _ query: [String: String] = [:], done: @escaping (Result<String?, APIError>) -> Void) {
-        send("GET", url(path, query), accept: "application/vnd.github.raw") { r in
+    func raw(_ path: String, _ query: [String: String] = [:], cache: TimeInterval = 0, done: @escaping (Result<String?, APIError>) -> Void) {
+        send(url(path, query), accept: "application/vnd.github.raw", cache: cache) { r in
             done(r.map { data in
                 if data.prefix(4096).contains(0) { return nil }
                 return String(decoding: data, as: UTF8.self)
@@ -77,20 +92,13 @@ final class API {
         }
     }
 
-    /// A change: star, unstar, mark read.
-    func act(_ method: String, _ path: String, done: @escaping (Bool) -> Void) {
-        send(method, url(path), accept: "application/vnd.github+json") { r in
-            if case .success = r { done(true) } else { done(false) }
-        }
-    }
-
-    private func send(_ method: String, _ u: URL, accept: String, done: @escaping (Result<Data, APIError>) -> Void) {
+    private func send(_ u: URL, accept: String, cache: TimeInterval, done: @escaping (Result<Data, APIError>) -> Void) {
+        let key = accept + "\n" + u.absoluteString
+        if cache > 0, let d = DiskCache.read(key, maxAge: cache) { done(.success(d)); return }   // free, from disk
         var req = URLRequest(url: u)
-        req.httpMethod = method
         req.setValue(accept, forHTTPHeaderField: "Accept")
-        if method == "PUT" { req.setValue("0", forHTTPHeaderField: "Content-Length") }
-        if let t = token ?? lentToken { req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization") }
         session.dataTask(with: req) { data, resp, err in
+            if let h = resp as? HTTPURLResponse { RateLimit.capture(h) }
             let r: Result<Data, APIError>
             if let err = err {
                 r = .failure(.offline((err as NSError).code == NSURLErrorNotConnectedToInternet ? "No internet connection." : err.localizedDescription))
@@ -98,71 +106,38 @@ final class API {
                 let msg = (data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any])?["message"] as? String ?? ""
                 r = .failure(.http(h.statusCode, msg))
             } else {
-                r = .success(data ?? Data())
+                let d = data ?? Data()
+                if cache > 0 { DiskCache.write(key, d) }
+                r = .success(d)
             }
             DispatchQueue.main.async { done(r) }
         }.resume()
     }
-
-    // MARK: signing in
-
-    /// Checks a token with GitHub and keeps it in the Keychain if it works.
-    func signIn(_ t: String, done: @escaping (String?) -> Void) {
-        let old = token
-        token = t.trimmingCharacters(in: .whitespacesAndNewlines)
-        json("user") { r in
-            switch r {
-            case .success(let j):
-                self.me = (j as? [String: Any])?["login"] as? String
-                Keychain.save(self.token!)
-                NotificationCenter.default.post(name: API.signedIn, object: nil)
-                done(nil)
-            case .failure(let e):
-                self.token = old
-                done(e.description)
-            }
-        }
-    }
-
-    func signOut() {
-        token = nil
-        me = nil
-        Keychain.delete()
-        NotificationCenter.default.post(name: API.signedIn, object: nil)
-    }
-
-    /// Finds the signed-in user's login (needed for a few lists).
-    func whoAmI(_ done: @escaping (String?) -> Void) {
-        if let m = me { done(m); return }
-        guard isSignedIn else { done(nil); return }
-        json("user") { r in
-            if case .success(let j) = r { self.me = (j as? [String: Any])?["login"] as? String }
-            done(self.me)
-        }
-    }
 }
 
-/// The token lives in the iPhone's Keychain, not in the app's files.
-enum Keychain {
-    private static let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "yrs.hub", kSecAttrAccount as String: "token"]
+/// A short-lived on-disk cache of GitHub replies, so re-opening things is instant and free.
+enum DiskCache {
+    private static let dir: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let d = base.appendingPathComponent("yrs-hub", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }()
 
-    static func read() -> String? {
-        var item: CFTypeRef?
-        var query = q
-        query[kSecReturnData as String] = true
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let d = item as? Data else { return nil }
-        return String(data: d, encoding: .utf8)
+    private static func file(_ key: String) -> URL {
+        var h: UInt64 = 14695981039346656037          // FNV-1a — a stable name for this key
+        for b in key.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
+        return dir.appendingPathComponent(String(h, radix: 16) + ".cache")
     }
 
-    static func save(_ t: String) {
-        delete()
-        var a = q
-        a[kSecValueData as String] = Data(t.utf8)
-        a[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(a as CFDictionary, nil)
+    static func read(_ key: String, maxAge: TimeInterval) -> Data? {
+        let f = file(key)
+        guard let m = (try? FileManager.default.attributesOfItem(atPath: f.path))?[.modificationDate] as? Date,
+              Date().timeIntervalSince(m) < maxAge else { return nil }
+        return try? Data(contentsOf: f)
     }
 
-    static func delete() { SecItemDelete(q as CFDictionary) }
+    static func write(_ key: String, _ data: Data) { try? data.write(to: file(key), options: .atomic) }
 }
 
 // MARK: - reading the JSON

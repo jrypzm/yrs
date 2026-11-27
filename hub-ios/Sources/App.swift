@@ -16,7 +16,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         UINavigationBar.appearance().standardAppearance = bar
         UINavigationBar.appearance().scrollEdgeAppearance = bar
 
-        let nav = UINavigationController(rootViewController: HomeVC())
+        let nav = UINavigationController(rootViewController: SearchHomeVC())
         let w = UIWindow(frame: UIScreen.main.bounds)
         w.backgroundColor = .black
         w.overrideUserInterfaceStyle = .dark
@@ -31,11 +31,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     /// Only for the screenshots taken with each build: `-demo repo:owner/name` and the like.
     private func demo(_ nav: UINavigationController) {
         guard let d = UserDefaults.standard.string(forKey: "demo"), let colon = d.firstIndex(of: ":") else { return }
-        if let t = ProcessInfo.processInfo.environment["HUB_DEMO_TOKEN"], !t.isEmpty { API.shared.lentToken = t }
         let kind = d[..<colon], arg = String(d[d.index(after: colon)...])
         var vc: UIViewController?
         switch kind {
-        case "search": vc = HomeVC.search(arg)
+        case "search": vc = searchResults(arg)
         case "repo": vc = RepoVC(arg)
         case "readme": vc = Screens.readme(arg, ref: "")
         case "code": vc = Screens.files(arg, "", ref: "")

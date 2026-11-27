@@ -6,11 +6,11 @@ extension API {
     static let perPage = 40
 
     /// One page of a list; `key` when the list sits inside the reply (search results).
-    func list(_ path: String, _ query: [String: String] = [:], page: Int, key: String? = nil, parse: @escaping (JSON) -> Item?, done: @escaping Feed.Done) {
+    func list(_ path: String, _ query: [String: String] = [:], page: Int, key: String? = nil, cache: TimeInterval = 0, parse: @escaping (JSON) -> Item?, done: @escaping Feed.Done) {
         var q = query
         q["per_page"] = "\(API.perPage)"
         q["page"] = "\(page)"
-        json(path, q) { r in
+        json(path, q, cache: cache) { r in
             done(r.map { j in
                 // unwrapped step by step: iOS 15 doesn't look inside an optional wrapped in Any
                 let arr: [JSON]
@@ -22,8 +22,8 @@ extension API {
 }
 
 /// A list screen for one API list.
-func listVC(_ title: String, _ path: String, _ query: [String: String] = [:], key: String? = nil, parse: @escaping (JSON) -> Item?) -> Feed {
-    Feed(title) { _, page, done in API.shared.list(path, query, page: page, key: key, parse: parse, done: done) }
+func listVC(_ title: String, _ path: String, _ query: [String: String] = [:], key: String? = nil, cache: TimeInterval = 0, parse: @escaping (JSON) -> Item?) -> Feed {
+    Feed(title) { _, page, done in API.shared.list(path, query, page: page, key: key, cache: cache, parse: parse, done: done) }
 }
 
 private func repoOf(_ apiURL: String) -> String {
@@ -44,7 +44,7 @@ enum Make {
         if j["archived"] as? Bool == true { bits.append("archived") }
         if !j.s("pushed_at").isEmpty { bits.append(ago(j.s("pushed_at"))) }
         let d = j.s("description")
-        return Item(title: full, detail: (d.isEmpty ? "" : d + "\n") + joined(bits), open: { RepoVC(full) })
+        return Item(title: full, detail: (d.isEmpty ? "" : d + "\n") + joined(bits), open: { RepoVC(json: j) })
     }
 
     static func user(_ j: JSON) -> Item {
@@ -88,8 +88,8 @@ enum Make {
         if j["prerelease"] as? Bool == true { bits.append("pre-release") }
         if j["draft"] as? Bool == true { bits.append("draft") }
         let n = (j["assets"] as? [JSON])?.count ?? 0
-        if n > 0 { bits.append("\(n) files") }
-        return Item(title: name, detail: joined(bits), open: { Screens.release(j) })
+        if n > 0 { bits.append(n == 1 ? "1 file" : "\(n) files") }
+        return Item(title: name, detail: joined(bits), open: { ReleaseVC(j) })
     }
 
     static func file(_ j: JSON, repo: String, ref: String) -> Item {
@@ -107,29 +107,6 @@ enum Make {
         }, dim: false)
     }
 
-    static func notification(_ j: JSON) -> Item {
-        let s = j.o("subject")
-        let repo = j.o("repository").s("full_name")
-        let unread = j["unread"] as? Bool == true
-        let id = j.s("id")
-        let reason = j.s("reason").replacingOccurrences(of: "_", with: " ")
-        let kind = s.s("type").replacingOccurrences(of: "PullRequest", with: "pull request").lowercased()
-        return Item(title: s.s("title"), detail: joined([repo, kind, reason, ago(j.s("updated_at")), unread ? "unread" : ""]), open: {
-            if unread { API.shared.act("PATCH", "notifications/threads/\(id)") { _ in } }
-            let api = s.s("url")
-            let parts = api.components(separatedBy: "/")
-            if let n = Int(parts.last ?? ""), api.contains("/issues/") || api.contains("/pulls/") {
-                return ThreadVC(repo, n, pr: api.contains("/pulls/"))
-            }
-            if api.contains("/releases/") {
-                return TextVC(s.s("title")) { done in
-                    API.shared.json(api) { r in done(r.map { Screens.releaseText(($0 as? JSON) ?? [:]) }) }
-                }
-            }
-            if api.contains("/commits/"), let sha = parts.last { return Screens.commit(repo, sha) }
-            return RepoVC(repo)
-        }, dim: !unread)
-    }
 }
 
 // MARK: - text screens
@@ -140,7 +117,7 @@ enum Screens {
     static func files(_ repo: String, _ path: String, ref: String) -> Feed {
         let name = path.isEmpty ? "Code" : (path as NSString).lastPathComponent
         return Feed(name) { _, _, done in
-            API.shared.json("repos/\(repo)/contents/\(path)", ref.isEmpty ? [:] : ["ref": ref]) { r in
+            API.shared.json("repos/\(repo)/contents/\(path)", ref.isEmpty ? [:] : ["ref": ref], cache: 300) { r in
                 done(r.map { j in
                     var arr = j as? [JSON] ?? []
                     arr.sort { a, b in
@@ -158,7 +135,7 @@ enum Screens {
         let dir = (path as NSString).deletingLastPathComponent
         let md = ["md", "markdown", "mdown"].contains((name as NSString).pathExtension.lowercased())
         return TextVC(name, repo: repo, ref: ref, dir: dir) { done in
-            API.shared.raw("repos/\(repo)/contents/\(path)", ref.isEmpty ? [:] : ["ref": ref]) { r in
+            API.shared.raw("repos/\(repo)/contents/\(path)", ref.isEmpty ? [:] : ["ref": ref], cache: 600) { r in
                 done(r.map { text in
                     guard let text = text else {
                         return NSAttributedString(string: "This file isn't text.", attributes: [.font: Style.body, .foregroundColor: Style.dim])
@@ -179,7 +156,7 @@ enum Screens {
 
     static func readme(_ repo: String, ref: String) -> TextVC {
         TextVC("README", repo: repo, ref: ref) { done in
-            API.shared.raw("repos/\(repo)/readme") { r in
+            API.shared.raw("repos/\(repo)/readme", cache: 900) { r in
                 done(r.map { t in Markdown.render(t ?? "").result })
             }
         }
@@ -210,160 +187,169 @@ enum Screens {
         }
     }
 
-    static func releaseText(_ j: JSON) -> NSAttributedString {
-        let d = Doc()
-        d.text(j.s("name").isEmpty ? j.s("tag_name") : j.s("name"), Style.bold(20), .white, Style.para(after: 4))
-        d.text(joined([j.s("tag_name"), j.o("author").s("login"), ago(j.s("published_at"))]), .systemFont(ofSize: 13), Style.dim, Style.para(after: 14))
-        let assets = j["assets"] as? [JSON] ?? []
-        if !assets.isEmpty {
-            d.text("Files", Style.bold(16), .white, Style.para(after: 6))
-            for a in assets {
-                let s = NSMutableAttributedString(string: a.s("name"), attributes: [.font: Style.body, .foregroundColor: Style.link])
-                if let u = URL(string: a.s("browser_download_url")) { s.addAttribute(.link, value: u, range: NSRange(location: 0, length: s.length)) }
-                let kb = a.i("size") / 1024
-                s.append(NSAttributedString(string: "  " + (kb > 1024 ? "\(kb / 1024) MB" : "\(kb) KB") + " · \(a.i("download_count")) downloads", attributes: [.font: UIFont.systemFont(ofSize: 13), .foregroundColor: Style.dim]))
-                d.add(s, Style.para(after: 5))
-            }
-            d.gap(8)
-        }
-        Markdown.render(j.s("body"), into: d)
-        return d.result
-    }
-
-    static func release(_ j: JSON) -> TextVC {
-        let t = releaseText(j)
-        return TextVC(j.s("tag_name")) { done in done(.success(t)) }
-    }
 }
 
-// MARK: - home
+// MARK: - a release, with downloadable files
 
-final class HomeVC: Feed, UISearchBarDelegate {
-    private let bar = UISearchBar()
+/// One release: its notes at the top, then each file as a row you tap to download (to Files / share).
+final class ReleaseVC: Feed {
+    private let j: JSON
+    private var observation: NSKeyValueObservation?
 
-    init() {
-        super.init("hub")
-        NotificationCenter.default.addObserver(self, selector: #selector(build), name: API.signedIn, object: nil)
+    init(_ j: JSON) {
+        self.j = j
+        super.init(j.s("tag_name").isEmpty ? (j.s("name").isEmpty ? "Release" : j.s("name")) : j.s("tag_name"))
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        bar.placeholder = "Search, owner/repo, or paste a link"
+        let j = self.j
+        let d = Doc()
+        d.text(j.s("name").isEmpty ? j.s("tag_name") : j.s("name"), Style.bold(20), .white, Style.para(after: 4))
+        var bits = [j.s("tag_name"), j.o("author").s("login"), ago(j.s("published_at"))]
+        if j["prerelease"] as? Bool == true { bits.append("pre-release") }
+        d.text(joined(bits), .systemFont(ofSize: 13), Style.dim, Style.para(after: 14))
+        let body = j.s("body")
+        if !body.isEmpty { Markdown.render(body, into: d) }
+        setHeader(d.result)
+
+        let assets = j["assets"] as? [JSON] ?? []
+        var rows: [Item] = assets.map { a in
+            let kb = a.i("size") / 1024
+            let size = kb >= 1024 ? String(format: "%.1f MB", Double(kb) / 1024) : "\(kb) KB"
+            let dls = a.i("download_count")
+            return Item(title: "⤓  " + a.s("name"),
+                        detail: joined([size, dls > 0 ? "\(count(dls)) downloads" : ""]),
+                        action: { [weak self] in self?.download(a) })
+        }
+        // the auto-generated source archive is always available
+        if let zip = j["zipball_url"] as? String, !zip.isEmpty {
+            rows.append(Item(title: "⤓  Source code (zip)", action: { [weak self] in
+                self?.download(["browser_download_url": zip, "name": (j.s("tag_name").isEmpty ? "source" : j.s("tag_name")) + ".zip"])
+            }))
+        }
+        if assets.isEmpty { rows.insert(Item(title: "No attached files — only the source code.", dim: true), at: 0) }
+        rows.append(Item(title: "Open release on GitHub", action: {
+            if let u = URL(string: j.s("html_url")) { UIApplication.shared.open(u) }
+        }))
+        show(rows)
+    }
+
+    /// Downloads an asset to a temp file at its real name, then offers the share sheet (Save to Files…).
+    private func download(_ a: JSON) {
+        guard let u = URL(string: a.s("browser_download_url")) else { return }
+        let name = a.s("name").isEmpty ? (u.lastPathComponent.isEmpty ? "download" : u.lastPathComponent) : a.s("name")
+        let progress = UIAlertController(title: "Downloading", message: name + "\n0%", preferredStyle: .alert)
+        progress.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(progress, animated: true)
+        let task = URLSession.shared.downloadTask(with: u) { [weak self] tmp, resp, err in
+            DispatchQueue.main.async {
+                self?.observation = nil
+                guard let self = self, self.presentedViewController === progress else { return }   // cancelled or gone
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                progress.dismiss(animated: true) {
+                    guard let tmp = tmp, err == nil, (200 ..< 400).contains(code) else {
+                        self.tell("Couldn't download — \(err?.localizedDescription ?? "GitHub answered \(code).")")
+                        return
+                    }
+                    let dest = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+                    try? FileManager.default.removeItem(at: dest)
+                    do { try FileManager.default.moveItem(at: tmp, to: dest) } catch { self.tell("Couldn't save the file."); return }
+                    let share = UIActivityViewController(activityItems: [dest], applicationActivities: nil)
+                    share.popoverPresentationController?.sourceView = self.view
+                    share.popoverPresentationController?.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY, width: 1, height: 1)
+                    self.present(share, animated: true)
+                }
+            }
+        }
+        observation = task.progress.observe(\.fractionCompleted) { p, _ in
+            DispatchQueue.main.async { progress.message = name + "\n\(Int(p.fractionCompleted * 100))%" }
+        }
+        task.resume()
+    }
+
+    private func tell(_ t: String) {
+        let a = UIAlertController(title: t, message: nil, preferredStyle: .alert)
+        a.addAction(UIAlertAction(title: "OK", style: .default))
+        present(a, animated: true)
+    }
+}
+
+// MARK: - home
+
+/// The whole app opens here: a search field in the middle, nothing else. Type and go.
+final class SearchHomeVC: UIViewController, UISearchBarDelegate {
+    private let name = UILabel()
+    private let hint = UILabel()
+    private let bar = UISearchBar()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        navigationItem.backButtonDisplayMode = .minimal
+        name.text = "hub"
+        name.font = .systemFont(ofSize: 46, weight: .bold)
+        name.textColor = .white
+        name.textAlignment = .center
+        hint.text = "Search GitHub — a repo, a topic, or a user"
+        hint.font = .systemFont(ofSize: 15)
+        hint.textColor = Style.dim
+        hint.textAlignment = .center
+        hint.numberOfLines = 0
+        bar.placeholder = "Search repositories"
         bar.searchBarStyle = .minimal
         bar.barStyle = .black
         bar.autocapitalizationType = .none
         bar.autocorrectionType = .no
+        bar.returnKeyType = .search
         bar.delegate = self
-        bar.sizeToFit()
-        tableView.tableHeaderView = bar
-        tableView.keyboardDismissMode = .onDrag
-        build()
+        [name, hint, bar].forEach { view.addSubview($0) }
+        view.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard)))
     }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        navigationController?.setNavigationBarHidden(true, animated: animated)
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        navigationController?.setNavigationBarHidden(false, animated: animated)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let w = view.bounds.width, mid = view.bounds.height * 0.3
+        name.frame = CGRect(x: 0, y: mid, width: w, height: 54)
+        hint.frame = CGRect(x: 24, y: mid + 62, width: w - 48, height: 40)
+        bar.frame = CGRect(x: 18, y: mid + 112, width: w - 36, height: 56)
+    }
+
+    @objc private func dismissKeyboard() { bar.resignFirstResponder() }
 
     func searchBarSearchButtonClicked(_ b: UISearchBar) {
         let q = (b.text ?? "").trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return }
         b.resignFirstResponder()
-        if let u = Router.github(q) { Router.open(u, from: self, pasted: true); return }
-        navigationController?.pushViewController(HomeVC.search(q), animated: true)
+        if let u = Router.github(q) { Router.open(u, from: self, pasted: true); return }   // a pasted github.com link
+        navigationController?.pushViewController(searchResults(q), animated: true)
     }
+}
 
-    /// Paste any GitHub link (a repository, an issue, a pull request, a file, a person) and go there.
-    private func openLink(_ error: String? = nil) {
-        let a = UIAlertController(title: "Open a GitHub link", message: error ?? "Paste a link to a repository, issue, pull request, file or person.", preferredStyle: .alert)
-        a.addTextField { f in
-            f.placeholder = "https://github.com/owner/repo"
-            f.keyboardType = .URL
-            f.autocorrectionType = .no
-            f.autocapitalizationType = .none
-            f.clearButtonMode = .always
-            // a GitHub link already copied is filled in
-            if UIPasteboard.general.hasStrings, let c = UIPasteboard.general.string, Router.github(c) != nil { f.text = c.trimmingCharacters(in: .whitespacesAndNewlines) }
-        }
-        a.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        a.addAction(UIAlertAction(title: "Open", style: .default) { [weak self, weak a] _ in
-            guard let s = self else { return }
-            let t = (a?.textFields?.first?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if let u = Router.github(t) {
-                Router.open(u, from: s, pasted: true)
-            } else if t.split(separator: "/").count == 2, !t.contains(" ") {
-                s.navigationController?.pushViewController(RepoVC(t), animated: true)
-            } else if !t.isEmpty {
-                s.openLink("That isn't a GitHub link. Try again.")
-            }
-        })
-        present(a, animated: true)
-    }
-
-    /// "owner/repo" opens it; anything else is searched.
-    static func search(_ q: String) -> UIViewController {
-        let parts = q.split(separator: "/")
-        if parts.count == 2, !q.contains(" ") { return RepoVC(q) }
-        return Feed(q, choices: ["Repos", "Issues", "PRs", "People"]) { choice, page, done in
-            switch choice {
-            case 0: API.shared.list("search/repositories", ["q": q], page: page, key: "items", parse: Make.repo, done: done)
-            case 1: API.shared.list("search/issues", ["q": q + " is:issue"], page: page, key: "items", parse: { Make.issue($0) }, done: done)
-            case 2: API.shared.list("search/issues", ["q": q + " is:pr"], page: page, key: "items", parse: { Make.issue($0) }, done: done)
-            default: API.shared.list("search/users", ["q": q], page: page, key: "items", parse: Make.user, done: done)
-            }
-        }
-    }
-
-    @objc private func build() {
-        let api = API.shared
-        let link = Item(title: "Open a GitHub link", detail: "Paste a link to go straight to a repository, issue, pull request, file or person.", action: { [weak self] in self?.openLink() })
-        guard api.isSignedIn else {
-            show([
-                link,
-                Item(title: "Sign in with a token", detail: "Optional. Adds your notifications, repositories, stars and pull requests, and a higher hourly limit. Kept in the iPhone's Keychain.", action: { [weak self] in self?.signIn() }),
-                Item(title: "Signed out, you can still search and read all of public GitHub.", dim: true),
-            ])
-            return
-        }
-        let mine = { (title: String, q: String) in
-            Item(title: title, open: { listVC(title, "search/issues", ["q": q, "sort": "updated"], key: "items") { Make.issue($0) } })
-        }
-        show([
-            link,
-            Item(title: "Notifications", open: { listVC("Notifications", "notifications", parse: Make.notification) }),
-            Item(title: "Your repositories", open: { listVC("Repositories", "user/repos", ["sort": "pushed"], parse: Make.repo) }),
-            Item(title: "Starred", open: { listVC("Starred", "user/starred", parse: Make.repo) }),
-            mine("Your pull requests", "is:pr is:open author:@me"),
-            mine("Review requests", "is:pr is:open review-requested:@me"),
-            mine("Your issues", "is:issue is:open author:@me"),
-            mine("Assigned to you", "is:open assignee:@me"),
-            Item(title: "Your profile", action: { [weak self] in
-                api.whoAmI { me in if let m = me { self?.navigationController?.pushViewController(UserVC(m), animated: true) } }
-            }),
-            Item(title: "Sign out", action: { [weak self] in
-                let a = UIAlertController(title: "Sign out?", message: "The token is removed from this iPhone.", preferredStyle: .alert)
-                a.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-                a.addAction(UIAlertAction(title: "Sign out", style: .destructive) { _ in api.signOut() })
-                self?.present(a, animated: true)
-            }),
-        ])
-    }
-
-    private func signIn(_ error: String? = nil) {
-        let a = UIAlertController(title: "Sign in", message: error ?? "Paste a GitHub personal access token. \"Make a token\" opens GitHub with the right boxes ticked (repo, notifications).", preferredStyle: .alert)
-        a.addTextField { f in
-            f.placeholder = "ghp_… or github_pat_…"
-            f.isSecureTextEntry = true
-            f.autocorrectionType = .no
-            f.autocapitalizationType = .none
-        }
-        a.addAction(UIAlertAction(title: "Make a token", style: .default) { _ in
-            UIApplication.shared.open(URL(string: "https://github.com/settings/tokens/new?scopes=repo,notifications,read:user&description=hub%20for%20iPhone")!)
-        })
-        a.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        a.addAction(UIAlertAction(title: "Sign in", style: .default) { [weak self, weak a] _ in
-            let t = a?.textFields?.first?.text ?? ""
-            guard !t.isEmpty else { return }
-            API.shared.signIn(t) { err in if let e = err { self?.signIn(e) } }
-        })
-        present(a, animated: true)
+/// Where a search goes: `owner/repo` opens that repo; otherwise a sortable repo search. Type a word for
+/// many related repos, or `user:name` for someone's repos (both ride the generous search budget).
+func searchResults(_ q: String) -> UIViewController {
+    let trimmed = q.trimmingCharacters(in: .whitespaces)
+    let parts = trimmed.split(separator: "/")
+    if parts.count == 2, !trimmed.contains(" "), !trimmed.contains(":") { return RepoVC("\(parts[0])/\(parts[1])") }
+    let sorts = ["Best match", "Stars", "Forks", "Updated"]
+    let keys = ["", "stars", "forks", "updated"]
+    return Feed(trimmed, choices: sorts) { choice, page, done in
+        var query = ["q": trimmed]
+        if choice > 0 { query["sort"] = keys[choice]; query["order"] = "desc" }
+        API.shared.list("search/repositories", query, page: page, key: "items", cache: 120, parse: Make.repo, done: done)
     }
 }
 
@@ -371,18 +357,33 @@ final class HomeVC: Feed, UISearchBarDelegate {
 
 final class RepoVC: Feed {
     let full: String
-    private var starred: Bool?
+    private let preloaded: JSON?
 
+    /// Opened by name (typed, or from a link): fetches the repo once, cached.
     init(_ full: String) {
         self.full = full
+        self.preloaded = nil
         super.init(full.split(separator: "/").last.map(String.init) ?? full)
+        fetch = { [weak self] _, _, done in self?.load(done) }
+    }
+
+    /// Opened from a search result: the JSON already has everything, so this costs no extra request.
+    init(json j: JSON) {
+        self.full = j.s("full_name")
+        self.preloaded = j
+        super.init(j.s("full_name").split(separator: "/").last.map(String.init) ?? j.s("full_name"))
         fetch = { [weak self] _, _, done in self?.load(done) }
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     private func load(_ done: @escaping Feed.Done) {
-        API.shared.json("repos/\(full)") { [weak self] r in
+        if let j = preloaded {                       // from search: no request at all
+            header(j)
+            done(.success((rows(j), false)))
+            return
+        }
+        API.shared.json("repos/\(full)", cache: 600) { [weak self] r in
             guard let s = self else { return }
             switch r {
             case .failure(let e): done(.failure(e))
@@ -390,7 +391,6 @@ final class RepoVC: Feed {
                 let j = j as? JSON ?? [:]
                 s.header(j)
                 done(.success((s.rows(j), false)))
-                s.checkStar()
             }
         }
     }
@@ -399,11 +399,12 @@ final class RepoVC: Feed {
         let d = Doc()
         d.text(j.s("full_name"), Style.bold(20), .white, Style.para(after: 6))
         if !j.s("description").isEmpty { d.text(j.s("description"), Style.body, Style.text) }
-        var bits = ["★ " + count(j.i("stargazers_count")), count(j.i("forks_count")) + " forks", j.s("language"), j.o("license").s("spdx_id")]
-        if j["private"] as? Bool == true { bits.append("private") }
+        var bits = ["★ " + count(j.i("stargazers_count")), count(j.i("forks_count")) + " forks", "\(j.i("open_issues_count")) issues", j.s("language"), j.o("license").s("spdx_id")]
         if j["archived"] as? Bool == true { bits.append("archived") }
         bits.append("updated " + ago(j.s("pushed_at")))
-        d.text(joined(bits.filter { $0 != "NOASSERTION" }), .systemFont(ofSize: 13), Style.dim, Style.para(after: 2))
+        d.text(joined(bits.filter { $0 != "NOASSERTION" && $0 != "0 issues" }), .systemFont(ofSize: 13), Style.dim, Style.para(after: 2))
+        let topics = (j["topics"] as? [String]) ?? []
+        if !topics.isEmpty { d.text(topics.prefix(8).joined(separator: " · "), .systemFont(ofSize: 13), Style.link, Style.para(after: 2)) }
         if !j.s("homepage").isEmpty, let u = URL(string: j.s("homepage")) {
             d.add(NSAttributedString(string: j.s("homepage"), attributes: [.font: UIFont.systemFont(ofSize: 13), .foregroundColor: Style.link, .link: u]))
         }
@@ -415,31 +416,9 @@ final class RepoVC: Feed {
         let ref = j.s("default_branch")
         let owner = j.o("owner").s("login")
         var rows: [Item] = [
+            Item(title: "Releases", detail: "download files", open: { listVC("Releases", "repos/\(full)/releases", cache: 300, parse: Make.release) }),
             Item(title: "README", open: { Screens.readme(full, ref: ref) }),
             Item(title: "Code", detail: ref, open: { Screens.files(full, "", ref: ref) }),
-            Item(title: "Issues", open: {
-                Feed("Issues", choices: ["Open", "Closed"]) { c, page, done in
-                    API.shared.list("repos/\(full)/issues", ["state": c == 0 ? "open" : "closed"], page: page, parse: { $0["pull_request"] == nil ? Make.issue($0, repo: full) : nil }, done: done)
-                }
-            }),
-            Item(title: "Pull requests", open: {
-                Feed("Pull requests", choices: ["Open", "Closed"]) { c, page, done in
-                    API.shared.list("repos/\(full)/pulls", ["state": c == 0 ? "open" : "closed", "sort": "updated", "direction": "desc"], page: page, parse: { Make.pull($0, repo: full) }, done: done)
-                }
-            }),
-            Item(title: "Commits", detail: ref, open: { listVC("Commits", "repos/\(full)/commits", parse: { Make.commit($0, repo: full) }) }),
-            Item(title: "Releases", open: { listVC("Releases", "repos/\(full)/releases", parse: Make.release) }),
-            Item(title: "Branches", open: {
-                listVC("Branches", "repos/\(full)/branches", parse: { b in
-                    let name = b.s("name")
-                    return Item(title: name, open: { Screens.files(full, "", ref: name) })
-                })
-            }),
-            Item(title: "Contributors", open: { listVC("Contributors", "repos/\(full)/contributors", parse: { u in
-                var it = Make.user(u)
-                it.detail = "\(u.i("contributions")) commits"
-                return it
-            }) }),
             Item(title: "Owner", detail: owner, open: { UserVC(owner) }),
         ]
         let parent = j.o("parent").s("full_name")
@@ -448,30 +427,6 @@ final class RepoVC: Feed {
             if let u = URL(string: "https://github.com/\(full)") { UIApplication.shared.open(u) }
         }))
         return rows
-    }
-
-    // MARK: star
-
-    private func checkStar() {
-        guard API.shared.isSignedIn else { return }
-        API.shared.act("GET", "user/starred/\(full)") { [weak self] yes in
-            self?.starred = yes
-            self?.starButton()
-        }
-    }
-
-    private func starButton() {
-        guard let on = starred else { navigationItem.rightBarButtonItem = nil; return }
-        navigationItem.rightBarButtonItem = UIBarButtonItem(title: on ? "★ Starred" : "☆ Star", style: .plain, target: self, action: #selector(toggleStar))
-    }
-
-    @objc private func toggleStar() {
-        guard let on = starred else { return }
-        starred = !on
-        starButton()
-        API.shared.act(on ? "DELETE" : "PUT", "user/starred/\(full)") { [weak self] ok in
-            if !ok { self?.starred = on; self?.starButton() }
-        }
     }
 }
 
