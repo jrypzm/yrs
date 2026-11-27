@@ -2,6 +2,7 @@
 // with only a few screens' worth kept. Signed in, it also reads your own home feed; your Pinterest
 // login (the session cookie) stays in this app on your iPhone and is never saved or sent anywhere else.
 
+import AVFoundation
 import ImageIO
 import UIKit
 import WebKit
@@ -553,10 +554,10 @@ enum Pinterest {
 
 // MARK: - HLS video → MP4 (for streaming-only pins)
 
-/// Turns a Pinterest HLS video into one playable MP4 on the phone — no re-encoding, no ffmpeg. Modern
-/// HLS (CMAF/fMP4) is an init segment plus media fragments that concatenate byte-for-byte into a valid
-/// MP4, so this is just: fetch the playlist, download the pieces, join them. Full, lossless quality.
-/// An old MPEG-TS stream (no init segment) can't be assembled this way → caller shows a fallback.
+/// Turns a Pinterest HLS video into one playable MP4 on the phone — no ffmpeg. Modern HLS (CMAF/fMP4)
+/// is an init segment plus fragments that concatenate byte-for-byte into a valid MP4. Pinterest keeps
+/// AUDIO in a SEPARATE track, so we assemble the video and the audio each into a file, then mux them
+/// into one with AVFoundation. (An old MPEG-TS stream — no init segment — can't be assembled → fallback.)
 enum HLSVideo {
     private static let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
@@ -567,50 +568,68 @@ enum HLSVideo {
         return URLSession(configuration: c)
     }()
 
-    /// `progress` is 0…1 (on the main queue). `done` gets a local .mp4 file URL, or a short error code
-    /// ("ts" = MPEG-TS, can't assemble; else a generic failure).
-    static func assemble(_ master: URL, progress: @escaping (Double) -> Void, done: @escaping (URL?, String?) -> Void) {
+    /// `progress` is 0…1 (called on the main queue). `done` (main queue) gets a local .mp4 with video
+    /// AND audio, or an error code ("ts" = MPEG-TS can't assemble; else a generic failure).
+    static func assemble(_ master: URL, progress rawProgress: @escaping (Double) -> Void, done rawDone: @escaping (URL?, String?) -> Void) {
+        let progress: (Double) -> Void = { f in DispatchQueue.main.async { rawProgress(f) } }
+        let done: (URL?, String?) -> Void = { f, c in DispatchQueue.main.async { rawDone(f, c) } }
         text(master) { t in
-            guard let t = t else { fail("net", done); return }
-            if t.contains("#EXT-X-STREAM-INF") {                 // a master playlist → pick the best variant
-                guard let v = bestVariant(t, base: master) else { fail("net", done); return }
-                text(v) { mt in
-                    guard let mt = mt else { fail("net", done); return }
-                    build(mt, base: v, progress: progress, done: done)
+            guard let t = t else { done(nil, "net"); return }
+            guard t.contains("#EXT-X-STREAM-INF") else {              // already a media playlist (muxed)
+                parseDownload(t, base: master, progress: progress) { f, code in done(f, f == nil ? (code ?? "net") : nil) }
+                return
+            }
+            guard let s = pickStreams(t, base: master) else { done(nil, "net"); return }
+            let vWeight = s.audio == nil ? 1.0 : 0.5                   // video 0–50%, audio 50–90%, mux → 100%
+            mediaFile(s.video, progress: { progress($0 * vWeight) }) { vFile, code in
+                guard let vFile = vFile else { done(nil, code ?? "net"); return }
+                guard let audio = s.audio else { done(vFile, nil); return }   // audio already muxed into the video
+                mediaFile(audio, progress: { progress(0.5 + $0 * 0.4) }) { aFile, _ in
+                    guard let aFile = aFile else { done(vFile, nil); return }  // no audio → video-only (not worse)
+                    mux(video: vFile, audio: aFile) { out in progress(1); done(out ?? vFile, nil) }
                 }
-            } else {
-                build(t, base: master, progress: progress, done: done)
             }
         }
-    }
-
-    private static func fail(_ code: String, _ done: @escaping (URL?, String?) -> Void) {
-        DispatchQueue.main.async { done(nil, code) }
     }
 
     private static func text(_ u: URL, done: @escaping (String?) -> Void) {
         session.dataTask(with: u) { d, _, _ in done(d.flatMap { String(data: $0, encoding: .utf8) }) }.resume()
     }
 
-    /// The highest-resolution variant URI from a master playlist.
-    private static func bestVariant(_ master: String, base: URL) -> URL? {
+    /// Reads an HLS tag attribute, quoted ("…") or bare, e.g. attr(line, "AUDIO") / attr(line, "RESOLUTION").
+    private static func attr(_ line: String, _ key: String) -> String {
+        guard let r = line.range(of: key + "=") else { return "" }
+        let rest = line[r.upperBound...]
+        if rest.first == "\"" { return String(rest.dropFirst().prefix { $0 != "\"" }) }
+        return String(rest.prefix { $0 != "," && !$0.isWhitespace })
+    }
+
+    /// From a master playlist: the highest-resolution video variant and its paired audio rendition (if any).
+    private static func pickStreams(_ master: String, base: URL) -> (video: URL, audio: URL?)? {
         let lines = master.components(separatedBy: .newlines)
-        var best: (score: Int, url: URL)?
+        var audio: [String: URL] = [:]       // GROUP-ID → audio playlist
+        for raw in lines {
+            let l = raw.trimmingCharacters(in: .whitespaces)
+            if l.hasPrefix("#EXT-X-MEDIA:"), l.contains("TYPE=AUDIO") {
+                let gid = attr(l, "GROUP-ID"), uri = attr(l, "URI")
+                if !gid.isEmpty, !uri.isEmpty, let u = URL(string: uri, relativeTo: base)?.absoluteURL { audio[gid] = u }
+            }
+        }
+        var best: (score: Int, url: URL, group: String)?
         var i = 0
         while i < lines.count {
-            let line = lines[i].trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("#EXT-X-STREAM-INF") {
+            let l = lines[i].trimmingCharacters(in: .whitespaces)
+            if l.hasPrefix("#EXT-X-STREAM-INF") {
                 var score = 0
-                if let r = line.range(of: "RESOLUTION=") {
-                    let dims = line[r.upperBound...].prefix { $0 != "," && !$0.isWhitespace }.split(separator: "x")
-                    if dims.count == 2, let w = Int(dims[0]), let h = Int(dims[1]) { score = w * h }
-                }
-                if score == 0, let r = line.range(of: "BANDWIDTH=") { score = Int(line[r.upperBound...].prefix { $0.isNumber }) ?? 0 }
+                let res = attr(l, "RESOLUTION").split(separator: "x")
+                if res.count == 2, let w = Int(res[0]), let h = Int(res[1]) { score = w * h }
+                if score == 0 { score = Int(attr(l, "BANDWIDTH")) ?? 0 }
+                let group = attr(l, "AUDIO")
                 var j = i + 1
                 while j < lines.count {
                     let uri = lines[j].trimmingCharacters(in: .whitespaces)
                     if !uri.isEmpty, !uri.hasPrefix("#") {
-                        if let url = URL(string: uri, relativeTo: base)?.absoluteURL, best == nil || score > best!.score { best = (score, url) }
+                        if let u = URL(string: uri, relativeTo: base)?.absoluteURL, best == nil || score > best!.score { best = (score, u, group) }
                         break
                     }
                     j += 1
@@ -619,24 +638,28 @@ enum HLSVideo {
             }
             i += 1
         }
-        return best?.url
+        guard let b = best else { return nil }
+        return (b.url, audio[b.group])
     }
 
-    /// Parse a media playlist (init segment + fragments), download everything, and join in order.
-    private static func build(_ media: String, base: URL, progress: @escaping (Double) -> Void, done: @escaping (URL?, String?) -> Void) {
+    /// Fetch a media playlist (if needed), download its init + fragments, and join into one .mp4.
+    private static func mediaFile(_ url: URL, progress: @escaping (Double) -> Void, done: @escaping (URL?, String?) -> Void) {
+        text(url) { t in
+            guard let t = t else { done(nil, "net"); return }
+            parseDownload(t, base: url, progress: progress, done: done)
+        }
+    }
+
+    private static func parseDownload(_ media: String, base: URL, progress: @escaping (Double) -> Void, done: @escaping (URL?, String?) -> Void) {
         var initURL: URL?
         var segs: [URL] = []
         for raw in media.components(separatedBy: .newlines) {
             let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("#EXT-X-MAP:"), let r = line.range(of: "URI=\"") {
-                let uri = String(line[r.upperBound...].prefix { $0 != "\"" })
-                initURL = URL(string: uri, relativeTo: base)?.absoluteURL
-            } else if !line.isEmpty, !line.hasPrefix("#") {
-                if let u = URL(string: line, relativeTo: base)?.absoluteURL { segs.append(u) }
-            }
+            if line.hasPrefix("#EXT-X-MAP:") { let uri = attr(line, "URI"); if !uri.isEmpty { initURL = URL(string: uri, relativeTo: base)?.absoluteURL } }
+            else if !line.isEmpty, !line.hasPrefix("#") { if let u = URL(string: line, relativeTo: base)?.absoluteURL { segs.append(u) } }
         }
-        guard let initURL = initURL else { fail("ts", done); return }    // no init segment = MPEG-TS
-        guard !segs.isEmpty else { fail("net", done); return }
+        guard let initURL = initURL else { done(nil, "ts"); return }    // no init segment = MPEG-TS
+        guard !segs.isEmpty else { done(nil, "net"); return }
 
         let all = [initURL] + segs
         var parts = [Data?](repeating: nil, count: all.count)
@@ -653,19 +676,54 @@ enum HLSVideo {
                 finished += 1
                 let frac = Double(finished) / Double(all.count)
                 lock.unlock()
-                DispatchQueue.main.async { progress(frac) }
+                progress(frac)
                 group.leave()
             }.resume()
         }
         group.notify(queue: .global(qos: .userInitiated)) {
-            if failed { fail("net", done); return }
+            if failed { done(nil, "net"); return }
             var full = Data()
-            for p in parts { guard let p = p else { fail("net", done); return }; full.append(p) }
+            for p in parts { guard let p = p else { done(nil, "net"); return }; full.append(p) }
             let out = FileManager.default.temporaryDirectory.appendingPathComponent("yrs-\(UUID().uuidString).mp4")
-            do { try full.write(to: out) } catch { fail("save", done); return }
-            DispatchQueue.main.async { done(out, nil) }
+            do { try full.write(to: out) } catch { done(nil, "save"); return }
+            done(out, nil)
         }
     }
+
+    /// Mux a video-only file and an audio-only file into one MP4 — lossless passthrough, re-encoding only
+    /// if passthrough can't. On any failure, returns the video-only file so it's never worse than before.
+    private static func mux(video: URL, audio: URL, done: @escaping (URL?) -> Void) {
+        let comp = AVMutableComposition()
+        let vAsset = AVURLAsset(url: video), aAsset = AVURLAsset(url: audio)
+        guard let vTrack = vAsset.tracks(withMediaType: .video).first,
+              let vComp = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            cleanup(audio); done(video); return
+        }
+        do { try vComp.insertTimeRange(CMTimeRange(start: .zero, duration: vAsset.duration), of: vTrack, at: .zero) }
+        catch { cleanup(audio); done(video); return }
+        if let aTrack = aAsset.tracks(withMediaType: .audio).first,
+           let aComp = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
+            let dur = CMTimeMinimum(vAsset.duration, aAsset.duration)
+            try? aComp.insertTimeRange(CMTimeRange(start: .zero, duration: dur), of: aTrack, at: .zero)
+        }
+        exportComposition(comp, preset: AVAssetExportPresetPassthrough) { out in
+            if let out = out { cleanup(video); cleanup(audio); done(out); return }
+            exportComposition(comp, preset: AVAssetExportPresetHighestQuality) { out2 in
+                cleanup(audio)
+                if let out2 = out2 { cleanup(video); done(out2) } else { done(video) }
+            }
+        }
+    }
+
+    private static func exportComposition(_ comp: AVMutableComposition, preset: String, done: @escaping (URL?) -> Void) {
+        guard let export = AVAssetExportSession(asset: comp, presetName: preset) else { done(nil); return }
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("yrs-\(UUID().uuidString).mp4")
+        export.outputURL = out
+        export.outputFileType = .mp4
+        export.exportAsynchronously { done(export.status == .completed ? out : nil) }
+    }
+
+    private static func cleanup(_ u: URL) { try? FileManager.default.removeItem(at: u) }
 }
 
 // MARK: - pictures
