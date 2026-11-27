@@ -28,6 +28,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(accountChanged), name: Account.changed, object: nil)
         // the sign-in cookies may already be there from last time
         Account.refresh()
+        Images.trimDisk()   // keep the on-disk picture cache within its size cap
         demo()
         return true
     }

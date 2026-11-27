@@ -74,6 +74,11 @@ final class PinCell: UICollectionViewCell {
         picture.contentMode = .scaleAspectFill
         picture.clipsToBounds = true
         picture.layer.cornerRadius = 16
+        // Rounded + clipped corners force the GPU into an offscreen pass every single frame while
+        // scrolling. The picture is static once loaded, so rasterize it: the rounded result is computed
+        // once and cached as a bitmap, and scrolling just composites it. This is the corner-radius jank fix.
+        picture.layer.shouldRasterize = true
+        picture.layer.rasterizationScale = UIScreen.main.scale
         contentView.addSubview(picture)
         play.text = "▶"
         play.font = .systemFont(ofSize: 13)
@@ -103,8 +108,9 @@ final class PinCell: UICollectionViewCell {
         // size and much faster. Falls back to an idea/video cover. The full picture loads when you open a pin.
         guard let (u, _) = p.gridImage("236x") else { return }
         url = u
-        // the 236-wide source is already small; decode it at its own size (no shrinking, no upscaling)
-        task = Images.load(u, px: 1024) { [weak self] img in
+        // grid thumbnails come from Pinterest's small 236-wide source, so decode at the device's RAM
+        // budget (the same value the prefetcher uses, so a prefetched picture is exactly the one the cell wants).
+        task = Images.load(u, px: Images.ramCapPx) { [weak self] img in
             guard let s = self, s.url == u else { return }
             s.picture.image = img
         }
@@ -132,6 +138,8 @@ class GridVC: UICollectionViewController {
     private var generation = 0
     /// Pages in a row that brought no pins; after a few, stop asking.
     private var empty = 0
+    /// Pictures being fetched ahead of the scroll, so cells are ready — already in memory — before they appear.
+    private var prefetching: [IndexPath: URLSessionDataTask] = [:]
     private let note = UILabel()
     private let layout = Masonry()
     /// An optional band above the grid (the pin's own picture and details). Its height is measured
@@ -158,6 +166,7 @@ class GridVC: UICollectionViewController {
         collectionView.indicatorStyle = .white
         collectionView.alwaysBounceVertical = true
         collectionView.register(PinCell.self, forCellWithReuseIdentifier: "p")
+        collectionView.prefetchDataSource = self
         if headerView != nil {
             collectionView.register(HeaderHost.self, forSupplementaryViewOfKind: UICollectionView.elementKindSectionHeader, withReuseIdentifier: "h")
         }
@@ -184,6 +193,8 @@ class GridVC: UICollectionViewController {
         more = true
         loading = false
         empty = 0
+        prefetching.values.forEach { $0.cancel() }   // the old pins' index paths no longer mean anything
+        prefetching.removeAll()
         load(first: true)
     }
 
@@ -254,6 +265,23 @@ class GridVC: UICollectionViewController {
     override func didReceiveMemoryWarning() {
         super.didReceiveMemoryWarning()
         Images.forget()
+    }
+}
+
+extension GridVC: UICollectionViewDataSourcePrefetching {
+    /// Download and decode the pictures for cells about to scroll on, so they're already in memory by the
+    /// time they appear — this is what turns "watch each tile pop in" into "it's just there". Uses the same
+    /// per-cell size as the visible cell, so the warmed picture is the one the cell will ask for.
+    func collectionView(_ cv: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
+        for ip in indexPaths where prefetching[ip] == nil && pins.indices.contains(ip.item) {
+            guard let (u, _) = pins[ip.item].gridImage("236x") else { continue }
+            prefetching[ip] = Images.load(u, px: Images.ramCapPx) { [weak self] _ in self?.prefetching[ip] = nil }
+        }
+    }
+
+    /// Scrolled away before it was needed: stop the fetch so it doesn't crowd out the cells that are visible.
+    func collectionView(_ cv: UICollectionView, cancelPrefetchingForItemsAt indexPaths: [IndexPath]) {
+        for ip in indexPaths { prefetching[ip]?.cancel(); prefetching[ip] = nil }
     }
 }
 

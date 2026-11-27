@@ -731,8 +731,7 @@ enum HLSVideo {
 enum Images {
     private static let cache: NSCache<NSString, UIImage> = {
         let c = NSCache<NSString, UIImage>()
-        c.totalCostLimit = 4_000_000   // a few screens' worth of thumbnails, then the oldest go
-        c.countLimit = 80
+        c.totalCostLimit = 16_000_000   // a few screens' worth of thumbnails, then the oldest go
         return c
     }()
 
@@ -740,18 +739,43 @@ enum Images {
         let c = URLSessionConfiguration.ephemeral
         c.urlCache = nil
         c.requestCachePolicy = .reloadIgnoringLocalCacheData
-        c.httpMaximumConnectionsPerHost = 3
-        c.httpMaximumConnectionsPerHost = 5
+        c.httpMaximumConnectionsPerHost = 6
         c.httpAdditionalHeaders = ["User-Agent": safariUA, "Accept": "image/jpeg,image/png,image/*;q=0.8"]
         return URLSession(configuration: c)
     }()
 
+    /// What keeps scrolling smooth on an A9: decode only a couple of pictures at a time (decoding is the
+    /// heavy part), instead of letting every visible cell decode at once — the jank Opaline hit on an iPad mini 2.
+    private static let work: OperationQueue = {
+        let q = OperationQueue()
+        q.maxConcurrentOperationCount = 2
+        q.qualityOfService = .userInitiated
+        return q
+    }()
+
+    /// On-disk copy of the shrunk pictures, so a picture seen once never downloads or re-decodes again —
+    /// even after the app is relaunched. This is the big win: re-opening and scrolling back are instant.
+    private static let diskDir: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = base.appendingPathComponent("yrs-img", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    /// How large to decode on this device. A 2 GB iPhone (the 6s) keeps thumbnails small to spare memory;
+    /// newer phones get sharper ones. (Opaline does the same — thumbnail size chosen from device RAM.)
+    static let ramCapPx: CGFloat = {
+        let gb = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        return gb <= 2.5 ? 700 : 1400
+    }()
+
     static func forget() { cache.removeAllObjects() }
 
-    /// A picture shrunk to `px` pixels on its longest side.
+    /// A picture shrunk to `px` pixels on its longest side (never larger than this device's RAM budget).
     @discardableResult
     static func load(_ u: URL, px: CGFloat, done: @escaping (UIImage?) -> Void) -> URLSessionDataTask? {
-        get(u, key: "\(Int(px))", make: { downsample($0, px: px) }, done: done)
+        let px = min(px, ramCapPx)
+        return get(u, key: "\(Int(px))", make: { downsample($0, px: px) }, done: done)
     }
 
     /// A square thumbnail, filled to `side` points.
@@ -759,7 +783,7 @@ enum Images {
     static func thumb(_ u: URL, side: CGFloat, done: @escaping (UIImage?) -> Void) -> URLSessionDataTask? {
         let scale = UIScreen.main.scale
         return get(u, key: "t\(Int(side))", make: { d in
-            guard let img = downsample(d, px: side * scale * 2) else { return nil }
+            guard let img = downsample(d, px: min(side * scale * 2, ramCapPx)) else { return nil }
             let f = UIGraphicsImageRendererFormat()
             f.scale = scale
             f.opaque = true
@@ -770,18 +794,63 @@ enum Images {
         }, done: done)
     }
 
+    private static func diskURL(_ k: String) -> URL {
+        var h: UInt64 = 14695981039346656037          // FNV-1a — a stable name for this key
+        for b in k.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
+        return diskDir.appendingPathComponent(String(h, radix: 16) + ".img")
+    }
+
+    private static func remember(_ img: UIImage, _ k: String) {
+        cache.setObject(img, forKey: k as NSString, cost: Int(img.size.width * img.size.height * img.scale * img.scale * 4))
+    }
+
     private static func get(_ u: URL, key: String, make: @escaping (Data) -> UIImage?, done: @escaping (UIImage?) -> Void) -> URLSessionDataTask? {
-        let k = (key + u.absoluteString) as NSString
-        if let i = cache.object(forKey: k) { done(i); return nil }
-        let t = session.dataTask(with: u) { data, _, _ in
-            let img = data.flatMap { d in autoreleasepool { make(d) } }
-            DispatchQueue.main.async {
-                if let i = img { cache.setObject(i, forKey: k, cost: Int(i.size.width * i.size.height * i.scale * i.scale * 4)) }
-                done(img)
+        let k = key + u.absoluteString
+        if let i = cache.object(forKey: k as NSString) { done(i); return nil }   // already in memory — instant
+        let file = diskURL(k)
+        // the download; only resumed if the picture isn't already on disk
+        let task = session.dataTask(with: u) { data, _, _ in
+            guard let data = data else { DispatchQueue.main.async { done(nil) }; return }
+            work.addOperation {   // bounded — at most 2 decodes run at once
+                let img = autoreleasepool { make(data) }
+                if let img = img {
+                    remember(img, k)
+                    try? img.jpegData(compressionQuality: 0.85)?.write(to: file, options: .atomic)
+                }
+                DispatchQueue.main.async { done(img) }
             }
         }
-        t.resume()
-        return t
+        // check the disk first (also bounded); fall through to the download only on a miss
+        work.addOperation {
+            if let d = try? Data(contentsOf: file), let img = UIImage(data: d) {
+                remember(img, k)
+                DispatchQueue.main.async { done(img) }
+            } else {
+                task.resume()
+            }
+        }
+        return task
+    }
+
+    /// Keep the on-disk cache from growing forever: drop the oldest files past a size cap.
+    static func trimDisk() {
+        work.addOperation {
+            let fm = FileManager.default
+            let keys: [URLResourceKey] = [.contentModificationDateKey, .totalFileAllocatedSizeKey]
+            guard let files = try? fm.contentsOfDirectory(at: diskDir, includingPropertiesForKeys: keys) else { return }
+            var items = files.map { url -> (URL, Date, Int) in
+                let v = try? url.resourceValues(forKeys: Set(keys))
+                return (url, v?.contentModificationDate ?? .distantPast, v?.totalFileAllocatedSize ?? 0)
+            }
+            var total = items.reduce(0) { $0 + $1.2 }
+            let cap = 80_000_000
+            guard total > cap else { return }
+            items.sort { $0.1 < $1.1 }   // oldest first
+            for (url, _, size) in items where total > cap {
+                try? fm.removeItem(at: url)
+                total -= size
+            }
+        }
     }
 
     private static func downsample(_ d: Data, px: CGFloat) -> UIImage? {
